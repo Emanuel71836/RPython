@@ -1,7 +1,7 @@
 def main() -> int {
     i: int = 1;
     sum: int = 0;
-    while i <= 10 {
+    while i < 11 {  // Mudado de <= 10 para < 11
         sum = sum + i;
         i = i + 1;
     };
