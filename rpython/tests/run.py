@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+import rpython
+
+def execute_file(filepath: Path):
+    code = filepath.read_text(encoding="utf-8")
+    return rpython.compile_to_native(code)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit(1)
+    
+    path = Path(sys.argv[1])
+    if not path.is_file():
+        sys.exit(1)
+    
+    print(execute_file(path))

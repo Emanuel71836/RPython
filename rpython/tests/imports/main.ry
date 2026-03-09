@@ -1,0 +1,2 @@
+import "math.ry";
+add(1, 1)

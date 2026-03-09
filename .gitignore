@@ -1,0 +1,15 @@
+# Rust
+rpython/jit/__rust__/target/
+rpython/hand_test/__pycache__/
+rpython/tests/__pycache__/
+# Parser output
+rpython/parser/parser.out
+rpython/parser/parsetab.py
+rpython/parser/*.out
+rpython/parser/parsetab.*
+rpython/.venv
+rpython/jit-interp/__rust__/target
+*.pyc
+*.so
+*.pyd
+*.whl
