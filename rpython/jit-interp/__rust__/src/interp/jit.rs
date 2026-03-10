@@ -18,9 +18,9 @@ extern "C" {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Interpreted = 0,
-    /// baseline JIT: fast to compile, no optimisations
+// baseline JIT: fast to compile, no optimisations
     Baseline    = 1,
-    /// optimised JIT: full Cranelift opt passes, best throughput
+// optimised JIT: full Cranelift opt passes, best throughput
     Optimized   = 2,
 }
 
@@ -32,32 +32,39 @@ impl FuncProfile {
     fn new() -> Self { FuncProfile { call_count: 0, tier: Tier::Interpreted } }
 }
 
+// NaN-boxing helpers (free functions, no borrow conflicts)
+
+// value layout (matches value.rs):
+// int(i)  = 0x7ffa_0000_0000_0000 | (i & 0x0000_ffff_ffff_ffff)
+// bool(b) = 0x7ff9_0000_0000_0000 | (b & 1)
+// nil     = 0x0000_0000_0000_0000
+
 const INT_TAG:      i64 = 0x7ffa_0000_0000_0000_u64 as i64;
 const BOOL_TAG:     i64 = 0x7ff9_0000_0000_0000_u64 as i64;
 const PAYLOAD_MASK: i64 = 0x0000_ffff_ffff_ffff_u64 as i64;
 
-/// emit: address of register slot `r` (= regs_ptr + r*8)
+// emit: address of register slot `r` (= regs_ptr + r*8)
 #[inline]
 fn reg_addr(builder: &mut FunctionBuilder, regs_ptr: Value, r: usize) -> Value {
     let off  = builder.ins().iconst(types::I64, (r as i64) * 8);
     builder.ins().iadd(regs_ptr, off)
 }
 
-/// mit: load raw Value bits for register `r`
+// emit: load raw Value bits for register `r`
 #[inline]
 fn load_reg(builder: &mut FunctionBuilder, regs_ptr: Value, r: usize) -> Value {
     let addr = reg_addr(builder, regs_ptr, r);
     builder.ins().load(types::I64, MemFlags::new(), addr, 0)
 }
 
-/// emit: store `v` into register slot `r`
+// emit: store `v` into register slot `r`
 #[inline]
 fn store_reg(builder: &mut FunctionBuilder, regs_ptr: Value, r: usize, v: Value) {
     let addr = reg_addr(builder, regs_ptr, r);
     builder.ins().store(MemFlags::new(), v, addr, 0);
 }
 
-/// emit: unbox Value(int) → sign-extended i64 payload
+// emit: unbox Value(int) → sign-extended i64 payload
 #[inline]
 fn unbox_int(builder: &mut FunctionBuilder, v: Value) -> Value {
     let masked  = builder.ins().band_imm(v, PAYLOAD_MASK);
@@ -65,7 +72,7 @@ fn unbox_int(builder: &mut FunctionBuilder, v: Value) -> Value {
     builder.ins().sshr_imm(shifted, 16)
 }
 
-/// emit: box raw i64 → Value(int)
+// emit: box raw i64 → Value(int)
 #[inline]
 fn box_int(builder: &mut FunctionBuilder, v: Value) -> Value {
     let masked = builder.ins().band_imm(v, PAYLOAD_MASK);
@@ -73,12 +80,14 @@ fn box_int(builder: &mut FunctionBuilder, v: Value) -> Value {
     builder.ins().bor(tag, masked)
 }
 
-/// emit: box 1-bit i64 (0/1) → Value(bool)
+// emit: box 1-bit i64 (0/1) → Value(bool)
 #[inline]
 fn box_bool(builder: &mut FunctionBuilder, bit: Value) -> Value {
     let tag = builder.ins().iconst(types::I64, BOOL_TAG);
     builder.ins().bor(tag, bit)
 }
+
+// JitCompiler
 
 pub struct JitCompiler {
     baseline_module:  JITModule,
@@ -94,13 +103,16 @@ impl JitCompiler {
         baseline_threshold: u64,
         optimized_threshold: u64,
     ) -> Option<Self> {
-        // tier 1
+// tier-1: opt_level = none
         let mut t1_flags = settings::builder();
         t1_flags.set("opt_level",        "none").unwrap();
         t1_flags.set("enable_verifier",  "false").unwrap();
         let t1_flags = settings::Flags::new(t1_flags);
 
-        let host_arch = std::env::consts::ARCH; // "x86_64", "aarch64", …
+// detect the host architecture name at compile time so we can look up
+// the right ISA backend.  cranelift_codegen::isa::lookup_by_name accepts
+// the same strings as `target_triple` (e.g. "x86_64", "aarch64")
+        let host_arch = std::env::consts::ARCH;  // "x86_64", "aarch64", …
         let t1_isa = isa::lookup_by_name(host_arch)
             .map_err(|e| eprintln!("[JIT] ISA lookup failed for {}: {}", host_arch, e)).ok()?
             .finish(t1_flags)
@@ -109,7 +121,7 @@ impl JitCompiler {
         t1_jb.symbol("ry_jit_call", ry_jit_call as *const u8);
         let baseline_module = JITModule::new(t1_jb);
 
-        // tier 2
+// tier-2: opt_level = speed_and_size
         let mut t2_flags = settings::builder();
         t2_flags.set("opt_level",             "speed_and_size").unwrap();
         t2_flags.set("enable_verifier",       "false").unwrap();
@@ -140,6 +152,8 @@ impl JitCompiler {
             optimized_threshold,
         })
     }
+
+// called by the VM on every function invocation
 
     pub fn record_and_maybe_compile(
         &mut self,
@@ -176,6 +190,9 @@ impl JitCompiler {
         Some((target_tier, fn_ptr))
     }
 
+// compile a function immediately at Baseline tier, bypassing the call-count
+// threshold.  Used for on-stack replacement at function entry so that
+// functions called only once (e.g. the outer loop) still get JIT-compiled
     pub fn compile_immediately(
         &mut self,
         func_idx:   usize,
@@ -184,7 +201,7 @@ impl JitCompiler {
         num_regs:   usize,
     ) -> Option<NativeFunc> {
         if func_idx >= self.profiles.len() { return None; }
-        if self.profiles[func_idx].tier >= Tier::Baseline { return None; } // already compiled
+        if self.profiles[func_idx].tier >= Tier::Baseline { return None; }  // already compiled
 
         if Self::has_unsupported_opcodes(bytecode) || !Self::validate_jump_targets(bytecode) {
             return None;
@@ -199,6 +216,8 @@ impl JitCompiler {
         Some(fn_ptr)
     }
 
+// pre-flight checks
+
     fn has_unsupported_opcodes(bytecode: &[Instruction]) -> bool {
         bytecode.iter().any(|i| matches!(i.opcode(), OpCode::LoadString))
     }
@@ -211,6 +230,24 @@ impl JitCompiler {
         })
     }
 
+// core compiler
+
+// two-pass SSA compiler with block parameters (phi nodes):
+
+// pass 1 – liveness analysis:
+// for each block-entry point, compute the set of bytecode registers that
+// are live (read before being written in at least one predecessor path)
+// these become Cranelift block parameters so values flow through SSA edges
+// rather than memory
+
+// pass 2 – code emission:
+// maintain a `cache: Vec<Option<CrValue>>` that maps bytecode regs to the
+// current SSA value.  At jump/branch edges, pass the cached values as
+// block arguments instead of storing them to memory.  Memory is only
+// touched for Call (ry_jit_call reads args from regs_ptr) and Return
+
+// this eliminates ALL load/store overhead in hot loops
+
     fn compile_inner(
         &mut self,
         func_idx:    usize,
@@ -220,6 +257,13 @@ impl JitCompiler {
         tier:        Tier,
     ) -> Option<NativeFunc> {
         let tier_tag = match tier { Tier::Baseline => "t1", Tier::Optimized => "t2", _ => return None };
+        if cfg!(debug_assertions) {
+            println!("[JIT] func_{} bytecode ({} insns, {} regs):", func_idx, bytecode.len(), num_regs);
+            for (i, insn) in bytecode.iter().enumerate() {
+                println!("  {}: {:?} dst={} src1={} src2={} imm={}",
+                    i, insn.opcode(), insn.dst(), insn.src1(), insn.src2(), insn.imm());
+            }
+        }
         let sym = format!("func_{}_{}_{}", func_idx, tier_tag, self.profiles[func_idx].call_count);
 
         let module: &mut JITModule = match tier {
@@ -228,11 +272,11 @@ impl JitCompiler {
             _ => return None,
         };
 
-        // signature
+// signature
         let mut sig = module.make_signature();
-        sig.params.push(AbiParam::new(types::I64)); // *mut VM
-        sig.params.push(AbiParam::new(types::I64)); // *mut u64 register file
-        sig.params.push(AbiParam::new(types::I64)); // *mut u64 dispatch table
+        sig.params.push(AbiParam::new(types::I64));  // *mut VM
+        sig.params.push(AbiParam::new(types::I64));  // *mut u64 register file
+        sig.params.push(AbiParam::new(types::I64));  // *mut u64 dispatch table
         sig.returns.push(AbiParam::new(types::I64));
 
         let func_id = module.declare_function(&sym, Linkage::Export, &sig).ok()?;
@@ -247,11 +291,12 @@ impl JitCompiler {
         let helper_id  = module.declare_function("ry_jit_call", Linkage::Import, &helper_sig).unwrap();
         let helper_ref = module.declare_func_in_func(helper_id, &mut ctx.func);
 
-        // ir emission
+// iR emission
         {
             let mut bctx    = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut bctx);
 
+// pass 1: identify block boundaries and live-in sets
             let nr = num_regs.max(
                 bytecode.iter().map(|insn| {
                     [insn.dst(), insn.src1(), insn.src2()]
@@ -259,7 +304,7 @@ impl JitCompiler {
                 }).max().unwrap_or(0)
             );
 
-            // is_target[i] = true means instruction i starts a new block
+// is_target[i] = true means instruction i starts a new block
             let mut is_target = vec![false; bytecode.len()];
             is_target[0] = true;
             for (idx, insn) in bytecode.iter().enumerate() {
@@ -277,12 +322,25 @@ impl JitCompiler {
                 }
             }
 
+// proper backward dataflow liveness analysis
+// live_in[bi]  = registers live at entry of block bi
+// live_out[bi] = registers live at exit of block bi
+
+// equations (standard backward dataflow):
+// use[bi]     = regs read before written in bi
+// def[bi]     = regs written in bi
+// live_in[bi] = use[bi] ∪ (live_out[bi] − def[bi])
+// live_out[bi]= ∪ live_in[succ] for each successor succ of bi
+
+// iterate to fixpoint (converges in ≤ #blocks passes for acyclic;
+// one extra pass for back-edges)
+
             let block_starts: Vec<usize> = (0..bytecode.len()).filter(|&k| is_target[k]).collect();
             let nb = block_starts.len();
             let bs_index: HashMap<usize, usize> = block_starts.iter().enumerate()
                 .map(|(bi, &pc)| (pc, bi)).collect();
 
-            // compute use[], def[], and successor list for each block
+// compute use[], def[], and successor list for each block
             let mut block_use:  Vec<Vec<bool>> = vec![vec![false; nr]; nb];
             let mut block_def:  Vec<Vec<bool>> = vec![vec![false; nr]; nb];
             let mut block_succ: Vec<Vec<usize>> = vec![vec![]; nb];
@@ -298,7 +356,7 @@ impl JitCompiler {
                     let s2  = insn.src2() as usize;
                     let tgt = insn.imm() as usize;
 
-                    // record reads (use)
+// record reads (use)
                     let reads: &[usize] = match op {
                         OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div
                         | OpCode::Lt | OpCode::Le => &[s1, s2],
@@ -310,7 +368,7 @@ impl JitCompiler {
                         if r < nr && !written[r] { block_use[bi][r] = true; }
                     }
 
-                    // record writes (def)
+// record writes (def)
                     match op {
                         OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div
                         | OpCode::Lt | OpCode::Le | OpCode::LoadConst | OpCode::LoadBool
@@ -320,7 +378,7 @@ impl JitCompiler {
                         _ => {}
                     }
 
-                    // record successors (from the last instruction of this block).
+// record successors (from the last instruction of this block)
                     let is_last = ii == end - start - 1;
                     if is_last {
                         match op {
@@ -338,9 +396,9 @@ impl JitCompiler {
                                     block_succ[bi].push(bs_index[&fall]);
                                 }
                             }
-                            OpCode::Return => {} // no successors
+                            OpCode::Return => {}  // no successors
                             _ => {
-                                // fall-through to next block
+// fall-through to next block
                                 if bi + 1 < nb {
                                     block_succ[bi].push(bi + 1);
                                 }
@@ -348,24 +406,24 @@ impl JitCompiler {
                         }
                     }
                 }
-                block_def[bi] = written; // def = everything written
+                block_def[bi] = written;  // def = everything written
             }
 
-            // iterative backward pass until fixpoint
+// iterative backward pass until fixpoint
             let mut live_in_bits:  Vec<Vec<bool>> = vec![vec![false; nr]; nb];
             let mut live_out_bits: Vec<Vec<bool>> = vec![vec![false; nr]; nb];
             loop {
                 let mut changed = false;
-                // process blocks in reverse order (helps convergence)
+// process blocks in reverse order (helps convergence)
                 for bi in (0..nb).rev() {
-                    // live_out[bi] = union of live_in[succ]
+// live_out[bi] = union of live_in[succ]
                     let mut new_out = vec![false; nr];
                     for &s in &block_succ[bi] {
                         for r in 0..nr {
                             if live_in_bits[s][r] { new_out[r] = true; }
                         }
                     }
-                    // live_in[bi] = use[bi] ∪ (live_out[bi] − def[bi])
+// live_in[bi] = use[bi] ∪ (live_out[bi] − def[bi])
                     let mut new_in = block_use[bi].clone();
                     for r in 0..nr {
                         if new_out[r] && !block_def[bi][r] { new_in[r] = true; }
@@ -379,16 +437,17 @@ impl JitCompiler {
                 if !changed { break; }
             }
 
-            // convert bit-vectors to sorted register lists
+// convert bit-vectors to sorted register lists
             let live_in: Vec<Vec<usize>> = live_in_bits.iter()
                 .map(|bits| (0..nr).filter(|&r| bits[r]).collect())
                 .collect();
 
-            // create one Cranelift block per target, with block params for live-in regs
+// create one Cranelift block per target, with block params for live-in regs
             let blocks: Vec<Block> = block_starts.iter().map(|_| builder.create_block()).collect();
 
-            // entry block: function params (vm, regs, dispatch)
+// entry block: function params (vm, regs, dispatch)
             builder.append_block_params_for_function_params(blocks[0]);
+// non-entry blocks: one I64 param per live-in register
             for bi in 1..blocks.len() {
                 for _ in &live_in[bi] {
                     builder.append_block_param(blocks[bi], types::I64);
@@ -401,11 +460,19 @@ impl JitCompiler {
             let vm_ptr   = entry_params[0];
             let regs_ptr = entry_params[1];
 
+// sSA value cache
+// cache[r]   = current SSA Value for bytecode register r
+// is_raw[r]  = true  → cache[r] is a raw i64 (unboxed integer)
+// false → cache[r] is a boxed Value (NaN-tagged)
+// dirty[r]   = needs to be written (boxed) to regs_ptr before Call/jump
+
+// storing raw i64 eliminates the box→unbox round-trip that would
+// otherwise occur on every arithmetic op in a loop
             let mut cache:  Vec<Option<Value>> = vec![None; nr];
             let mut is_raw: Vec<bool>          = vec![false; nr];
             let mut dirty:  Vec<bool>          = vec![false; nr];
 
-            // get the cached value as a boxed Value (for stores, returns, jumps)
+// get the cached value as a boxed Value (for stores, returns, jumps)
             macro_rules! get_boxed {
                 ($r:expr) => {{
                     let r: usize = $r;
@@ -417,7 +484,7 @@ impl JitCompiler {
                 }}
             }
 
-            // get the cached value as a raw i64 (for arithmetic)
+// get the cached value as a raw i64 (for arithmetic)
             macro_rules! get_raw {
                 ($r:expr) => {{
                     let r: usize = $r;
@@ -432,7 +499,7 @@ impl JitCompiler {
                 }}
             }
 
-            // macros
+// macros
             macro_rules! flush_for_call {
                 () => {
                     for r in 0..nr {
@@ -460,7 +527,7 @@ impl JitCompiler {
                 }}
             }
 
-            // write a raw i64 (unboxed) to the cache — avoids box/unbox round-trip
+// write a raw i64 (unboxed) to the cache — avoids box/unbox round-trip
             macro_rules! write_raw {
                 ($r:expr, $v:expr) => {{
                     let r: usize = $r;
@@ -470,6 +537,10 @@ impl JitCompiler {
                 }}
             }
 
+// emit a jump to target block, passing current cache values as block args
+// raw-value jump: pass values as raw i64 block params
+// no memory flush needed — values flow via SSA edges
+// box only at Call/Return boundaries
             macro_rules! emit_jump_to {
                 ($tgt_pc:expr) => {{
                     let tgt_bi = bs_index[&$tgt_pc];
@@ -489,8 +560,8 @@ impl JitCompiler {
                 }}
             }
 
-            // pass 2 
-            let mut cur_bi = 0usize;       // current block index into `blocks`
+// pass 2: emit code
+            let mut cur_bi = 0usize;  // current block index into `blocks`
             let mut block_terminated = false;
 
             let mut i = 0usize;
@@ -498,7 +569,7 @@ impl JitCompiler {
                 let insn = bytecode[i];
                 let op   = insn.opcode();
 
-                // block boundary: switch to the new block, populate cache from params
+// block boundary: switch to the new block, populate cache from params
                 if is_target[i] && i > 0 {
                     if !block_terminated {
                         emit_jump_to!(i);
@@ -507,6 +578,9 @@ impl JitCompiler {
                     builder.switch_to_block(blocks[cur_bi]);
                     block_terminated = false;
 
+// populate cache from block params (raw i64 SSA values)
+// mark dirty so flush_for_call boxes and stores them to
+// regs_ptr before any Call that reads args from memory
                     cache.iter_mut().for_each(|c| *c = None);
                     is_raw.iter_mut().for_each(|r| *r = false);
                     dirty.iter_mut().for_each(|d| *d = false);
@@ -532,7 +606,7 @@ impl JitCompiler {
                             OpCode::Div => builder.ins().sdiv(i1, i2),
                             _ => unreachable!(),
                         };
-                        write_raw!(d, raw); // store as raw i64 — no boxing until needed
+                        write_raw!(d, raw);  // store as raw i64 — no boxing until needed
                     }
                     OpCode::Lt | OpCode::Le => {
                         let (d, s1, s2) = (insn.dst() as usize, insn.src1() as usize, insn.src2() as usize);
@@ -542,11 +616,11 @@ impl JitCompiler {
                         let cmp = builder.ins().icmp(cc, i1, i2);
                         let bit = builder.ins().uextend(types::I64, cmp);
                         let bv  = box_bool(&mut builder, bit);
-                        write_reg!(d, bv); // bool stays boxed (Branch reads bit 0)
+                        write_reg!(d, bv);  // bool stays boxed (Branch reads bit 0)
                     }
                     OpCode::LoadConst => {
                         let raw = builder.ins().iconst(types::I64, insn.imm() as i64);
-                        write_raw!(insn.dst() as usize, raw); // raw i64 constant
+                        write_raw!(insn.dst() as usize, raw);  // raw i64 constant
                     }
                     OpCode::LoadBool => {
                         let bit = builder.ins().iconst(types::I64, if insn.imm() != 0 { 1 } else { 0 });
@@ -562,17 +636,19 @@ impl JitCompiler {
                         block_terminated = true;
                     }
                     OpCode::Branch => {
+                        // branch jumps to tgt when cond is FALSE (else block)
+                        // falls through to fall (then block) when TRUE
                         let cond = read_reg!(insn.dst() as usize);
                         let bit  = builder.ins().band_imm(cond, 1i64);
                         let zero = builder.ins().iconst(types::I64, 0i64);
-                        let flag = builder.ins().icmp(IntCC::NotEqual, bit, zero);
+                        let flag = builder.ins().icmp(IntCC::Equal, bit, zero);  // TRUE when cond=false
                         let tgt  = insn.imm() as usize;
                         let fall = i + 1;
                         emit_brif_to!(flag, tgt, fall);
                         block_terminated = true;
                     }
                     OpCode::Return => {
-                        // caller expects a boxed Value
+// caller expects a boxed Value
                         let v = get_boxed!(insn.dst() as usize);
                         builder.ins().return_(&[v]);
                         block_terminated = true;
@@ -581,20 +657,24 @@ impl JitCompiler {
                     OpCode::Move => {
                         let s = insn.src1() as usize;
                         let d = insn.dst() as usize;
-                        // propagate raw flag so dont box/unbox unnecessarily
+// propagate raw flag so we don't box/unbox unnecessarily
                         if let Some(v) = cache[s] {
                             cache[d]  = Some(v);
                             is_raw[d] = is_raw[s];
                             dirty[d]  = true;
                         } else {
-                            // not in cache, load boxed from memory
+// not in cache: load boxed from memory
                             let v = load_reg(&mut builder, regs_ptr, s);
                             write_reg!(d, v);
                         }
                     }
                     OpCode::Call => {
-                        // flush live values so ry_jit_call can read args from regs_ptr
+// flush live values so ry_jit_call can read args from regs_ptr
                         flush_for_call!();
+// also write any values that ry_jit_call's callee needs to see
+// (args are placed at regs[0..num_params] by preceding Move insns)
+// after the call, invalidate cache (callee may have side-effects
+// on regs_ptr... it doesn't, but we reload the result anyway)
                         cache.iter_mut().for_each(|c| *c = None);
                         dirty.iter_mut().for_each(|d| *d = false);
                         let callee_imm = builder.ins().iconst(types::I64, insn.imm() as i64);
@@ -612,7 +692,7 @@ impl JitCompiler {
                     }
                 }
 
-                // implicit return at end of bytecode.
+// implicit return at end of bytecode
                 if !block_terminated && i + 1 >= bytecode.len() {
                     let z = builder.ins().iconst(types::I64, 0i64);
                     builder.ins().return_(&[z]);
@@ -626,6 +706,7 @@ impl JitCompiler {
             builder.finalize();
         }
 
+// define + finalise
         let module: &mut JITModule = match tier {
             Tier::Baseline  => &mut self.baseline_module,
             Tier::Optimized => &mut self.optimized_module,

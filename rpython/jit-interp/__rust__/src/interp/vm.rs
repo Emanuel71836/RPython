@@ -49,6 +49,8 @@ pub struct VM {
     max_call_depth: usize,
     pub jit_compiler: Option<JitCompiler>,
     pub compiled_functions: HashMap<usize, unsafe extern "C" fn(*mut VM, *mut u64, *mut u64) -> u64>,
+// dispatch_table[func_idx] = fn_ptr as u64, or 0 = not compiled
+// flat array: one load + branch = hot-path call dispatch
     pub dispatch_table: Vec<u64>,
 }
 
@@ -76,6 +78,8 @@ impl VM {
         let frames = Vec::with_capacity(max_call_depth);
 
         let baseline_t  = hot_threshold.max(1) as u64;
+// promote to Tier-2 after 3× baseline calls (not 10×) — hot loops hit
+// this quickly and benefit the most from speed_and_size optimisations
         let optimized_t = (baseline_t * 3).max(baseline_t + 1);
         let jit_compiler = JitCompiler::new(num_functions, baseline_t, optimized_t);
         let compiled_functions = HashMap::new();
@@ -115,10 +119,15 @@ impl VM {
                 return Err(format!("Infinite loop detected after {} instructions", instruction_count));
             }
 
+// on-stack replacement (OSR) at function entry
+// when the interpreter is about to execute the first instruction of
+// any function, try to JIT-compile it immediately.  This ensures
+// functions that are only called once (e.g. the outer loop) also get
+// compiled, not just frequently-called callees
             if frame.pc == 0 {
                 let func_idx  = frame.func_idx;
                 let reg_base  = frame.reg_base;
-                // skip if already compiled or not compilable
+// skip if already compiled or not compilable
                 if self.dispatch_table.get(func_idx).copied().unwrap_or(0) == 0 {
                     let promoted = if let Some(jit) = &mut self.jit_compiler {
                         let (bc, np, nr) = {
@@ -133,12 +142,12 @@ impl VM {
                         if func_idx < self.dispatch_table.len() {
                             self.dispatch_table[func_idx] = native_fn as u64;
                         }
-                        // pop current frame and run native code
+// pop current frame and run native code
                         self.frames.pop();
                         let regs_ptr     = self.register_pool.as_mut_ptr().wrapping_add(reg_base) as *mut u64;
                         let dispatch_ptr = self.dispatch_table.as_mut_ptr();
                         let ret_val = unsafe { native_fn(self as *mut VM, regs_ptr, dispatch_ptr) };
-                        // store result in caller's return slot (or return from run())
+// store result in caller's return slot (or return from run())
                         if let Some(caller) = self.frames.last_mut() {
                             self.register_pool[caller.return_reg] = Value(ret_val);
                         } else {
@@ -237,6 +246,8 @@ impl VM {
                     frame.pc = insn.imm() as usize;
                 }
                 OpCode::Branch => {
+                    // branch jumps to imm when condition is FALSE (else block)
+                    // falls through when TRUE (then block immediately follows)
                     let cond_reg = frame.reg_base + insn.dst() as usize;
                     let cond = self.register_pool[cond_reg];
                     let take = if let Some(b) = cond.to_bool() {
@@ -248,7 +259,7 @@ impl VM {
                     } else {
                         false
                     };
-                    if take {
+                    if !take {
                         frame.pc = insn.imm() as usize;
                     }
                 }
@@ -258,7 +269,7 @@ impl VM {
                     if cfg!(debug_assertions) && frame.func_idx == 1 {
                         println!("heavy returning: {:?}", ret_val);
                     }
-                    self.frames.pop(); // remove current frame
+                    self.frames.pop();  // remove current frame
                     if let Some(caller) = self.frames.last_mut() {
                         self.register_pool[caller.return_reg] = ret_val;
                     } else {
@@ -280,13 +291,6 @@ impl VM {
                         panic!("Call to undefined function index {}", func_idx);
                     }
 
-                    // record call for profiling
-                    self.profiler.record_call(func_idx);
-                    if cfg!(debug_assertions) {
-                        println!("[VM] Call to function {} (count now: {:?})", func_idx, self.profiler.call_counts.get(func_idx));
-                    }
-
-                    // extract necessary data before potential mutable borrow of self for JIT compilation
                     let current_frame_func_idx = frame.func_idx;
                     let current_frame_num_regs = self.functions[current_frame_func_idx].num_regs;
                     let dst_reg = insn.dst() as usize;
@@ -294,17 +298,17 @@ impl VM {
                     let num_params = self.functions[func_idx].num_params;
                     let new_base = frame.reg_base + current_frame_num_regs;
 
-                    // check stack overflow
+// check stack overflow
                     if new_base + self.functions[func_idx].num_regs > self.register_pool.len() {
                         panic!("Call stack overflow");
                     }
 
-                    // copy arguments to new register frame
+// copy arguments to new register frame
                     for i in 0..num_params {
                         self.register_pool[new_base + i] = self.register_pool[frame.reg_base + i];
                     }
 
-                    // fast path: dispatch table lookup (O(1), no HashMap)
+// fast path: dispatch table lookup (O(1), no HashMap)
                     if func_idx < self.dispatch_table.len() && self.dispatch_table[func_idx] != 0 {
                         let fn_bits = self.dispatch_table[func_idx];
                         let native_fn: unsafe extern "C" fn(*mut VM, *mut u64, *mut u64) -> u64 =
@@ -316,7 +320,7 @@ impl VM {
                         continue;
                     }
 
-                    // Not compiled yet – maybe compile it if hot
+// not compiled yet – maybe compile it if hot
                     if let Some(jit) = &mut self.jit_compiler {
                         self.profiler.record_call(func_idx);
                         let (bytecode, np, nr) = {
@@ -336,7 +340,7 @@ impl VM {
                         }
                     }
 
-                    // Interpreted call (including the first time after compilation attempt)
+// interpreted call (including the first time after compilation attempt)
                     let new_frame = Frame {
                         reg_base: new_base,
                         func_idx,
@@ -359,12 +363,17 @@ impl VM {
     }
 }
 
+// max registers per function frame — stack-allocated, no heap
 const MAX_REGS_PER_FRAME: usize = 256;
 
+// runtime helper called by JIT-compiled code to invoke another function
+
+// hot path  : dispatch_table[func_idx] != 0  → one array load + indirect call
+// cold path : record call, maybe compile, then call or interpret
 #[no_mangle]
 pub unsafe extern "C" fn ry_jit_call(
     vm: *mut VM,
-    regs_ptr: *mut u64,
+    regs_ptr: *mut u64,  // caller frame; args at [0..num_params]
     func_idx: usize,
     _nargs: usize,
 ) -> u64 {
@@ -372,6 +381,7 @@ pub unsafe extern "C" fn ry_jit_call(
     let num_params = vm.functions[func_idx].num_params;
     let num_regs   = vm.functions[func_idx].num_regs;
 
+// stack-allocate a fresh callee frame — zero cost, no malloc
     let mut frame_buf = [0u64; MAX_REGS_PER_FRAME];
     let usable = num_regs.min(MAX_REGS_PER_FRAME);
     for i in 0..num_params.min(usable) {
@@ -380,12 +390,14 @@ pub unsafe extern "C" fn ry_jit_call(
     let callee_ptr   = frame_buf.as_mut_ptr();
     let dispatch_ptr = vm.dispatch_table.as_mut_ptr();
 
+// hot path: dispatch table (single array index)
     if func_idx < vm.dispatch_table.len() && vm.dispatch_table[func_idx] != 0 {
         let native_fn: unsafe extern "C" fn(*mut VM, *mut u64, *mut u64) -> u64 =
             std::mem::transmute(vm.dispatch_table[func_idx]);
         return native_fn(vm as *mut VM, callee_ptr, dispatch_ptr);
     }
 
+// cold path: maybe compile
     if let Some(jit) = &mut vm.jit_compiler {
         let (bc, np, nr) = {
             let f = &vm.functions[func_idx];
@@ -403,6 +415,7 @@ pub unsafe extern "C" fn ry_jit_call(
         }
     }
 
+// slow path: interpret inline
     let bytecode = vm.functions[func_idx].bytecode.clone();
     let registers = std::slice::from_raw_parts_mut(callee_ptr as *mut Value, usable);
 
@@ -448,9 +461,10 @@ pub unsafe extern "C" fn ry_jit_call(
             }
             OpCode::Jump   => { pc = insn.imm() as usize; }
             OpCode::Branch => {
+                // jump to imm when FALSE
                 let cond = registers[insn.dst() as usize];
                 let take = cond.to_bool().unwrap_or_else(|| cond.to_int().map(|i| i != 0).unwrap_or(false));
-                if take { pc = insn.imm() as usize; }
+                if !take { pc = insn.imm() as usize; }
             }
             OpCode::Print => { println!("{:?}", registers[insn.dst() as usize]); }
             OpCode::Move  => {
@@ -458,8 +472,15 @@ pub unsafe extern "C" fn ry_jit_call(
                 registers[d] = registers[s];
             }
             OpCode::Call  => {
-                // nested call: recurse through ry_jit_call with our frame as arg source
-                let ret = ry_jit_call(vm as *mut VM, callee_ptr, insn.imm() as usize, 0);
+// copy args from current frame into callee frame before recursing
+                let nested_func = insn.imm() as usize;
+                let nested_np = if nested_func < vm.functions.len() {
+                    vm.functions[nested_func].num_params } else { 0 };
+                let mut nested_buf = [0u64; MAX_REGS_PER_FRAME];
+                for i in 0..nested_np.min(MAX_REGS_PER_FRAME) {
+                    nested_buf[i] = *callee_ptr.add(i);
+                }
+                let ret = ry_jit_call(vm as *mut VM, nested_buf.as_mut_ptr(), nested_func, 0);
                 registers[insn.dst() as usize] = Value(ret);
             }
             OpCode::Inc => {
@@ -519,4 +540,4 @@ pub unsafe extern "C" fn ry_call_function(
         }
     }
     Value::nil()
-}   
+}

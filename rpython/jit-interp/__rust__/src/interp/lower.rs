@@ -119,11 +119,13 @@ impl LoweringContext {
                         self.bytecode.push(Instruction::encode_imm(OpCode::Jump, 0, 0));
                         self.pending_jumps.push((pos, *target, false));
                     }
-                    IrNode::Branch(cond, t, _f) => {
+                    IrNode::Branch(cond, _t, f) => {
+                        // branch jumps to f (else block) when condition is FALSE
+                        // falls through to the next block (then block) when TRUE
                         let cond_reg = self.ensure_reg(*cond);
                         let pos = self.bytecode.len();
                         self.bytecode.push(Instruction::encode_imm(OpCode::Branch, cond_reg, 0));
-                        self.pending_jumps.push((pos, *t, true));
+                        self.pending_jumps.push((pos, *f, true));
                     }
                     IrNode::Return(val) => {
                         let rval = self.ensure_reg(*val);
