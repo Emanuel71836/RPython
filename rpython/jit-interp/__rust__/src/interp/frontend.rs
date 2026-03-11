@@ -13,6 +13,7 @@ pub enum Token {
     While,
     Return,
     Print,
+    Import,   // NEW: `import` keyword
     Plus,
     Minus,
     Star,
@@ -25,6 +26,7 @@ pub enum Token {
     LBrace,
     RBrace,
     Comma,
+    Dot,      // NEW: `.` for attribute access  (obj.method)
     EOF,
 }
 
@@ -44,6 +46,7 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             match c {
+                '.' => { self.chars.next(); return Token::Dot; }
                 '+' => { self.chars.next(); return Token::Plus; }
                 '-' => { self.chars.next(); return Token::Minus; }
                 '*' => { self.chars.next(); return Token::Star; }
@@ -92,6 +95,7 @@ impl<'a> Lexer<'a> {
                         "while" => return Token::While,
                         "return" => return Token::Return,
                         "print" => return Token::Print,
+                        "import" => return Token::Import,
                         _ => return Token::Ident(ident),
                     }
                 }
@@ -110,6 +114,10 @@ pub enum Expr {
     Assign(String, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
+    /// `obj.attr`  — attribute get on a Python object
+    GetAttr(Box<Expr>, String),
+    /// `obj.method(args…)` — method call on a Python object
+    MethodCall(Box<Expr>, String, Vec<Expr>),
 }
 
 #[derive(Debug)]
@@ -126,6 +134,8 @@ pub enum Stmt {
     Expr(Expr),
     Block(Vec<Stmt>),
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
+    /// `import <name>` — imports a Python module, binds to name
+    PyImport(String, String),  // (variable_name, module_name)
 }
 
 #[derive(Debug)]
@@ -158,12 +168,13 @@ impl<'a> Parser<'a> {
 
     pub fn parse_program(&mut self) -> (Vec<Func>, Vec<Stmt>) {
         let mut funcs = Vec::new();
-        while let Token::Fn = self.current {
-            funcs.push(self.parse_func());
-        }
         let mut stmts = Vec::new();
-        while self.current != Token::EOF {
-            stmts.push(self.parse_stmt());
+        loop {
+            match &self.current {
+                Token::Fn => { funcs.push(self.parse_func()); }
+                Token::EOF => break,
+                _ => { stmts.push(self.parse_stmt()); }
+            }
         }
         (funcs, stmts)
     }
@@ -201,6 +212,35 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt(&mut self) -> Stmt {
         match self.current {
+            // `import math` or `import numpy as np`
+            Token::Import => {
+                self.advance();
+                let module = if let Token::Ident(name) = self.current.clone() {
+                    self.advance();
+                    name
+                } else {
+                    panic!("Expected module name after 'import'");
+                };
+                // optional `as alias`
+                let alias = if let Token::Ident(ref kw) = self.current.clone() {
+                    if kw == "as" {
+                        self.advance();
+                        if let Token::Ident(alias) = self.current.clone() {
+                            self.advance();
+                            alias
+                        } else {
+                            panic!("Expected alias after 'as'");
+                        }
+                    } else {
+                        module.clone()
+                    }
+                } else {
+                    module.clone()
+                };
+                // consume optional semicolon
+                if self.current == Token::Semicolon { self.advance(); }
+                Stmt::PyImport(alias, module)
+            }
             Token::Let => {
                 self.advance();
                 if let Token::Ident(name) = self.current.clone() {
@@ -329,7 +369,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Expr {
-        match &self.current {
+        let mut expr = match &self.current {
             Token::Number(n) => { let n = *n; self.advance(); Expr::Number(n) }
             Token::String(s) => { let s = s.clone(); self.advance(); Expr::String(s) }
             Token::Ident(name) => {
@@ -347,11 +387,47 @@ impl<'a> Parser<'a> {
                     }
                     self.expect(Token::RParen);
                     Expr::Call(name, args)
-                } else { Expr::Variable(name) }
+                } else {
+                    Expr::Variable(name)
+                }
             }
-            Token::LParen => { self.advance(); let expr = self.parse_expr(); self.expect(Token::RParen); expr }
+            Token::LParen => {
+                self.advance();
+                let expr = self.parse_expr();
+                self.expect(Token::RParen);
+                expr
+            }
             _ => panic!("Unexpected token in primary: {:?}", self.current),
+        };
+
+        // Postfix: dot-access chains — `obj.attr` and `obj.method(args…)`
+        while self.current == Token::Dot {
+            self.advance(); // consume '.'
+            let attr = if let Token::Ident(a) = self.current.clone() {
+                self.advance();
+                a
+            } else {
+                panic!("Expected attribute name after '.'");
+            };
+            // Check if it's a method call
+            if self.current == Token::LParen {
+                self.advance();
+                let mut args = Vec::new();
+                if self.current != Token::RParen {
+                    args.push(self.parse_expr());
+                    while self.current == Token::Comma {
+                        self.advance();
+                        args.push(self.parse_expr());
+                    }
+                }
+                self.expect(Token::RParen);
+                expr = Expr::MethodCall(Box::new(expr), attr, args);
+            } else {
+                expr = Expr::GetAttr(Box::new(expr), attr);
+            }
         }
+
+        expr
     }
 }
 
@@ -490,6 +566,13 @@ impl CodeGen {
 
     fn gen_stmt(&mut self, stmt: &Stmt) {
         match stmt {
+            Stmt::PyImport(var_name, module_name) => {
+                // Emit ImportPython IR node; bind result to var_name in symbol table
+                let dst = self.new_value();
+                self.add_insn(IrNode::ImportPython(dst, module_name.clone()));
+                self.symbols.insert(var_name.clone(), dst);
+                self.last_expr_value = Some(dst);
+            }
             Stmt::Let(name, expr) => {
                 let val = self.gen_expr(expr);
                 self.symbols.insert(name.clone(), val);
@@ -591,15 +674,47 @@ impl CodeGen {
                     }
                 }
             }
-            Expr::Call(name, args) => {
-                let func_id = *self.func_index.get(name).unwrap_or_else(|| panic!("Unknown function {}", name));
+            Expr::GetAttr(obj_expr, attr_name) => {
+                let obj_val = self.gen_expr(obj_expr);
+                let dst = self.new_value();
+                self.add_insn(IrNode::GetAttr(dst, obj_val, attr_name.clone()));
+                dst
+            }
+            Expr::MethodCall(obj_expr, method_name, args) => {
+                // obj.method(args) ≡ tmp = GetAttr(obj, method); CallPython(tmp, args)
+                let obj_val = self.gen_expr(obj_expr);
+                let callable = self.new_value();
+                self.add_insn(IrNode::GetAttr(callable, obj_val, method_name.clone()));
                 let mut arg_vals = Vec::new();
                 for arg in args {
                     arg_vals.push(self.gen_expr(arg));
                 }
                 let dst = self.new_value();
-                self.add_insn(IrNode::Call(dst, func_id, arg_vals));
+                self.add_insn(IrNode::CallPython(dst, callable, arg_vals));
                 dst
+            }
+            Expr::Call(name, args) => {
+                if let Some(&func_id) = self.func_index.get(name) {
+                    // Known user-defined function — emit a native Call
+                    let mut arg_vals = Vec::new();
+                    for arg in args {
+                        arg_vals.push(self.gen_expr(arg));
+                    }
+                    let dst = self.new_value();
+                    self.add_insn(IrNode::Call(dst, func_id, arg_vals));
+                    dst
+                } else if let Some(&var_id) = self.symbols.get(name) {
+                    // Variable in scope — treat as Python callable
+                    let mut arg_vals = Vec::new();
+                    for arg in args {
+                        arg_vals.push(self.gen_expr(arg));
+                    }
+                    let dst = self.new_value();
+                    self.add_insn(IrNode::CallPython(dst, var_id, arg_vals));
+                    dst
+                } else {
+                    panic!("Unknown function or variable '{}'", name)
+                }
             }
             Expr::Binary(op, left, right) => {
                 let l = self.gen_expr(left);

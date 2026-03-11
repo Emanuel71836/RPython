@@ -8,6 +8,9 @@ const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
 const TAG_BOOL: u64 = 0x0001_0000_0000_0000;
 const TAG_INT:  u64 = 0x0002_0000_0000_0000;
 const TAG_OBJ:  u64 = 0x0003_0000_0000_0000;
+// TAG_PYOBJECT: holds a raw *mut pyo3::ffi::PyObject in the 48-bit payload.
+// Reference counting is managed manually: INCREF on store, DECREF on drop/overwrite.
+const TAG_PYOBJECT: u64 = 0x0004_0000_0000_0000;
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -68,6 +71,37 @@ impl Value {
     }
     pub fn nil() -> Self { Value(0) }
     pub fn is_nil(self) -> bool { self.0 == 0 }
+
+    // --- Python object support ---
+    /// Wrap a raw PyObject pointer.  The caller must have already called INCREF
+    /// (or have obtained an owned reference), so this simply stores the pointer.
+    pub fn from_pyobject(obj: *mut pyo3::ffi::PyObject) -> Self {
+        let ptr = obj as u64;
+        assert!(ptr & !PAYLOAD_MASK == 0, "PyObject pointer too large for NaN-box payload");
+        Value(QNAN | TAG_PYOBJECT | ptr)
+    }
+
+    pub fn to_pyobject(self) -> Option<*mut pyo3::ffi::PyObject> {
+        if (self.0 & QNAN) == QNAN && (self.0 & TAG_MASK) == (QNAN | TAG_PYOBJECT) {
+            Some((self.0 & PAYLOAD_MASK) as *mut pyo3::ffi::PyObject)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_pyobject(self) -> bool {
+        (self.0 & QNAN) == QNAN && (self.0 & TAG_MASK) == (QNAN | TAG_PYOBJECT)
+    }
+
+    /// Decrement the Python reference count.  Must be called while the GIL is held.
+    /// # Safety
+    /// The value must be a valid TAG_PYOBJECT with a live Python object.
+    pub unsafe fn pyobject_decref(self) {
+        if let Some(ptr) = self.to_pyobject() {
+            pyo3::ffi::Py_DECREF(ptr);
+        }
+    }
+
     pub fn lt(self, rhs: Self) -> Self {
         if let (Some(a), Some(b)) = (self.to_int(), rhs.to_int()) {
             Value::from_bool(a < b)
@@ -121,6 +155,7 @@ impl fmt::Debug for Value {
         else if let Some(i) = self.to_int() { write!(f, "{}", i) }
         else if let Some(x) = self.to_f64() { write!(f, "{}", x) }
         else if let Some(s) = self.to_string_from_arena() { write!(f, "{}", s) }
+        else if self.is_pyobject() { write!(f, "<PyObject@{:#x}>", self.0 & PAYLOAD_MASK) }
         else { write!(f, "Value({:#x})", self.0) }
     }
 }

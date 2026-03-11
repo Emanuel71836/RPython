@@ -4,6 +4,62 @@ use crate::arena::Arena;
 use crate::jit::JitCompiler;
 use std::rc::Rc;
 use std::collections::HashMap;
+use pyo3::prelude::*;
+use pyo3::BoundObject;
+use pyo3::types::{PyFloat, PyInt, PyBool, PyString};
+
+/// Convert a native [`Value`] to an owned Python object.
+/// The returned [`PyObject`] has a fresh reference (owned).
+fn value_to_pyobject(py: Python<'_>, v: Value) -> PyResult<PyObject> {
+    if let Some(b) = v.to_bool() {
+        // Check bool before int — bool is a subtype of int in Python.
+        // into_pyobject for bool returns Borrowed<PyBool>; call into_bound() to
+        // get an owned Bound, then convert to PyObject.
+        return Ok(b.into_pyobject(py)?.into_bound().into_any().unbind());
+    }
+    if let Some(i) = v.to_int() {
+        return Ok(i.into_pyobject(py)?.into_any().unbind());
+    }
+    if let Some(f) = v.to_f64() {
+        return Ok(f.into_pyobject(py)?.into_any().unbind());
+    }
+    if v.is_pyobject() {
+        // Already a Python object — return a new borrowed (bumped) reference.
+        let raw = v.to_pyobject().unwrap();
+        return Ok(unsafe { PyObject::from_borrowed_ptr(py, raw) });
+    }
+    if let Some(s) = v.to_string_from_arena() {
+        return Ok(s.into_pyobject(py)?.into_any().unbind());
+    }
+    // Nil → Python None
+    Ok(py.None())
+}
+
+/// Convert a Python object to the closest native [`Value`].
+fn pyobject_to_value(py: Python<'_>, obj: PyObject) -> PyResult<Value> {
+    let bound = obj.bind(py);
+    // Try bool first (bool is a subtype of int in Python, must check first)
+    if bound.is_instance_of::<PyBool>() {
+        let b: bool = bound.extract()?;
+        return Ok(Value::from_bool(b));
+    }
+    if bound.is_instance_of::<PyInt>() {
+        let i: i64 = bound.extract()?;
+        return Ok(Value::from_int(i));
+    }
+    if bound.is_instance_of::<PyFloat>() {
+        let f: f64 = bound.extract()?;
+        return Ok(Value::from_f64(f));
+    }
+    if bound.is_instance_of::<PyString>() {
+        // Keep strings as opaque PyObject values; caller can use ConvertFromPy
+        let raw = obj.into_ptr();
+        return Ok(Value::from_pyobject(raw));
+    }
+    // Everything else: wrap as opaque PyObject
+    Ok(Value::from_pyobject(obj.into_ptr()))
+}
+
 
 struct Function {
     bytecode: Rc<Vec<Instruction>>,
@@ -353,6 +409,115 @@ impl VM {
                     let reg = frame.reg_base + insn.dst() as usize;
                     self.register_pool[reg] = self.register_pool[reg] + Value::from_int(1);
                 }
+
+                // ── Python interop opcodes ────────────────────────────────────
+
+                OpCode::ImportPython => {
+                    // encoding: dst=rd, imm=string_pool_index
+                    let dst = frame.reg_base + insn.dst() as usize;
+                    let idx = insn.imm() as usize;
+                    let module_name = self.string_pool[idx].clone();
+                    let val = pyo3::Python::with_gil(|py| -> pyo3::PyResult<Value> {
+                        let module = pyo3::types::PyModule::import(py, module_name.as_str())?;
+                        // `into_ptr` consumes the reference and returns an OWNED (ref-count +1) pointer
+                        let raw = pyo3::PyObject::from(module).into_ptr();
+                        Ok(Value::from_pyobject(raw))
+                    }).unwrap_or_else(|e| {
+                        pyo3::Python::with_gil(|py| e.print(py));
+                        panic!("ImportPython: failed to import module '{}'", module_name);
+                    });
+                    self.register_pool[dst] = val;
+                }
+
+                OpCode::GetAttr => {
+                    // encoding: raw word — bits[23:16]=dst, bits[15:8]=obj_reg, bits[7:0]=attr_idx
+                    let rd      = insn.dst() as usize;
+                    let ro      = insn.src1() as usize;
+                    let attr_idx = insn.src2() as usize; // attr string index stored in src2/lower byte
+                    let dst     = frame.reg_base + rd;
+                    let obj_reg = frame.reg_base + ro;
+                    let attr    = self.string_pool[attr_idx].clone();
+                    let obj_val = self.register_pool[obj_reg];
+                    let raw_obj = obj_val.to_pyobject()
+                        .unwrap_or_else(|| panic!("GetAttr: register is not a PyObject"));
+                    let val = pyo3::Python::with_gil(|py| -> pyo3::PyResult<Value> {
+                        let obj = unsafe { pyo3::PyObject::from_borrowed_ptr(py, raw_obj) };
+                        let attr_obj = obj.getattr(py, attr.as_str())?;
+                        let raw = attr_obj.into_ptr();
+                        Ok(Value::from_pyobject(raw))
+                    }).unwrap_or_else(|e| {
+                        pyo3::Python::with_gil(|py| e.print(py));
+                        panic!("GetAttr: failed to get attribute '{}'", attr);
+                    });
+                    self.register_pool[dst] = val;
+                }
+
+                OpCode::CallPython => {
+                    // encoding: dst=rd, src1=callable_reg, src2=nargs
+                    // Args live at frame.reg_base + rd + 1 .. + nargs  (placed by lowerer)
+                    let rd   = insn.dst() as usize;
+                    let rc   = insn.src1() as usize;
+                    let nargs = insn.src2() as usize;
+                    let dst          = frame.reg_base + rd;
+                    let callable_reg = frame.reg_base + rc;
+                    let callable_val = self.register_pool[callable_reg];
+                    let raw_callable = callable_val.to_pyobject()
+                        .unwrap_or_else(|| panic!("CallPython: register is not a callable PyObject"));
+
+                    // Collect argument Values from the register window (rd+1, rd+2, …)
+                    let mut arg_vals: Vec<Value> = Vec::with_capacity(nargs);
+                    for i in 0..nargs {
+                        arg_vals.push(self.register_pool[frame.reg_base + rd + 1 + i]);
+                    }
+
+                    let val = pyo3::Python::with_gil(|py| -> pyo3::PyResult<Value> {
+                        let callable = unsafe { pyo3::PyObject::from_borrowed_ptr(py, raw_callable) };
+                        // Convert each arg to a Python object
+                        let py_args: Vec<pyo3::PyObject> = arg_vals.iter().map(|v| {
+                            value_to_pyobject(py, *v)
+                        }).collect::<pyo3::PyResult<Vec<_>>>()?;
+                        // PyTuple::new returns PyResult<Bound<PyTuple>>; Bound<PyTuple>
+                        // implements IntoPyObject<Target=PyTuple> so pass it directly to call1.
+                        let tuple = pyo3::types::PyTuple::new(py, py_args)?;
+                        let result = callable.call1(py, tuple)?;
+                        // Convert result back to Value
+                        pyobject_to_value(py, result)
+                    }).unwrap_or_else(|e| {
+                        pyo3::Python::with_gil(|py| e.print(py));
+                        panic!("CallPython: call failed");
+                    });
+                    self.register_pool[dst] = val;
+                }
+
+                OpCode::ConvertToPy => {
+                    let dst = frame.reg_base + insn.dst() as usize;
+                    let src = frame.reg_base + insn.src1() as usize;
+                    let native = self.register_pool[src];
+                    let py_val = pyo3::Python::with_gil(|py| -> pyo3::PyResult<Value> {
+                        let obj = value_to_pyobject(py, native)?;
+                        Ok(Value::from_pyobject(obj.into_ptr()))
+                    }).unwrap_or_else(|e| {
+                        pyo3::Python::with_gil(|py| e.print(py));
+                        panic!("ConvertToPy: conversion failed");
+                    });
+                    self.register_pool[dst] = py_val;
+                }
+
+                OpCode::ConvertFromPy => {
+                    let dst = frame.reg_base + insn.dst() as usize;
+                    let src = frame.reg_base + insn.src1() as usize;
+                    let py_val = self.register_pool[src];
+                    let raw = py_val.to_pyobject()
+                        .unwrap_or_else(|| panic!("ConvertFromPy: src is not a PyObject"));
+                    let native = pyo3::Python::with_gil(|py| -> pyo3::PyResult<Value> {
+                        let obj = unsafe { pyo3::PyObject::from_borrowed_ptr(py, raw) };
+                        pyobject_to_value(py, obj)
+                    }).unwrap_or_else(|e| {
+                        pyo3::Python::with_gil(|py| e.print(py));
+                        panic!("ConvertFromPy: conversion failed");
+                    });
+                    self.register_pool[dst] = native;
+                }
             }
         }
         Ok(Value::nil())
@@ -486,6 +651,11 @@ pub unsafe extern "C" fn ry_jit_call(
             OpCode::Inc => {
                 let r = insn.dst() as usize;
                 registers[r] = registers[r] + Value::from_int(1);
+            }
+            OpCode::ImportPython | OpCode::GetAttr | OpCode::CallPython
+            | OpCode::ConvertToPy | OpCode::ConvertFromPy => {
+                panic!("Python interop opcode {:?} encountered in JIT slow-path interpreter; \
+                        this should be executed by the main VM loop, not ry_jit_call", insn.opcode());
             }
         }
     }

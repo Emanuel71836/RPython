@@ -1,0 +1,47 @@
+// example.ry
+// Demonstrates calling Python stdlib from .ry code.
+// Run via Python:
+//   import rpython
+//   rpython.compile_file_py("example.ry")
+
+// ── 1. Pure .ry functions ─────────────────────────────────────────────────────
+
+def add(a: int, b: int) -> int {
+    return a + b
+}
+
+def fib(n: int) -> int {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+// ── 2. Python stdlib imports ──────────────────────────────────────────────────
+
+import math
+import random as rnd
+
+// ── 3. math.sqrt via method-call syntax ──────────────────────────────────────
+
+x: int = 144
+result: int = math.sqrt(x)     // result holds a PyObject (Python float 12.0)
+print(result)
+
+// ── 4. math.factorial ────────────────────────────────────────────────────────
+
+fact: int = math.factorial(10)
+print(fact)                     // 3628800
+
+// ── 5. random.randint ────────────────────────────────────────────────────────
+
+r: int = rnd.randint(1, 100)
+print(r)                        // some integer in [1, 100]
+
+// ── 6. Pure .ry calls ────────────────────────────────────────────────────────
+
+a: int = add(3, 4)
+print(a)                        // 7
+
+f: int = fib(10)
+print(f)                        // 55

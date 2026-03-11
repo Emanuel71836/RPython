@@ -13,3 +13,4 @@ rpython/jit-interp/__rust__/target
 *.so
 *.pyd
 *.whl
+*.venv

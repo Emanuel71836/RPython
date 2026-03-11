@@ -26,6 +26,17 @@ pub enum IrNode {
     Print(ValueId),
     Call(ValueId, FunctionId, Vec<ValueId>),
     Move(ValueId, ValueId),
+    // Python interop -----------------------------------------------------------
+    /// ImportPython(dst, module_name)
+    ImportPython(ValueId, String),
+    /// GetAttr(dst, object_val, attr_name)
+    GetAttr(ValueId, ValueId, String),
+    /// CallPython(dst, callable_val, arg_vals)
+    CallPython(ValueId, ValueId, Vec<ValueId>),
+    /// ConvertToPy(dst, src) – native Value → Python object
+    ConvertToPy(ValueId, ValueId),
+    /// ConvertFromPy(dst, src) – Python object → native Value
+    ConvertFromPy(ValueId, ValueId),
 }
 
 #[derive(Debug, Clone)]

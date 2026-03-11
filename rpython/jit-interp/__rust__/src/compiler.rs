@@ -67,7 +67,7 @@ impl Interpreter {
                 self.eval_expr(expr);
                 None
             }
-            Statement::FunctionDef(_) => None, // Functions handled by lookup
+            Statement::FunctionDef(_) => None, // functions handled by lookup
         }
     }
 

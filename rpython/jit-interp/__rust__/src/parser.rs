@@ -71,9 +71,38 @@ impl rpythonParser {
         }
     }
 
+    fn dotcall(node: Node) -> Result<Expr> {
+        let mut all: Vec<Node> = node.into_children().collect();
+        let mut idx = 0;
+
+        // first child is always primary
+        let mut res = Self::primary(all.remove(0))?;
+
+        // process remaining children as dot-suffix tokens
+        while !all.is_empty() {
+            // ext must be an identifier (the attr / method name)
+            let name_node = all.remove(0);
+            let name = Self::identifier(name_node)?;
+
+            // Collect consecutive expr children as method arguments
+            let mut args: Vec<Expr> = Vec::new();
+            while !all.is_empty() && all[0].as_rule() == Rule::expr {
+                let expr_node = all.remove(0);
+                args.push(Self::expr(expr_node)?);
+            }
+
+            res = if args.is_empty() {
+                Expr::GetAttr(Box::new(res), name)
+            } else {
+                Expr::MethodCall(Box::new(res), name, args)
+            };
+        }
+        Ok(res)
+    }
+
     fn mul_expr(node: Node) -> Result<Expr> {
         let mut children = node.into_children();
-        let mut res = Self::primary(children.next().unwrap())?;
+        let mut res = Self::dotcall(children.next().unwrap())?;
         while let Some(op_node) = children.next() {
             let op = match op_node.as_rule() {
                 Rule::mul => match op_node.as_str() {
@@ -83,7 +112,7 @@ impl rpythonParser {
                 },
                 _ => unreachable!(),
             };
-            let right = Self::primary(children.next().unwrap())?;
+            let right = Self::dotcall(children.next().unwrap())?;
             res = Expr::BinOp {
                 left: Box::new(res),
                 op,
@@ -234,10 +263,24 @@ impl rpythonParser {
         Ok(Statement::Import(filename))
     }
 
+    fn py_import_statement(node: Node) -> Result<Statement> {
+        let mut children = node.into_children();
+        let module_node = children.next().unwrap();
+        let module = Self::identifier(module_node)?;
+        let alias = if let Some(alias_node) = children.next() {
+            Self::identifier(alias_node)?
+        } else {
+            module.clone()
+        };
+        // Encode as PyImport variant
+        Ok(Statement::PyImport { alias, module })
+    }
+
     fn statement(node: Node) -> Result<Statement> {
         let child = node.into_children().next().unwrap();
         match child.as_rule() {
             Rule::import_statement => Self::import_statement(child),
+            Rule::py_import_statement => Self::py_import_statement(child),
             Rule::var_decl => Self::var_decl(child),
             Rule::function_def => Self::function_def(child),
             Rule::return_statement => Self::return_statement(child),
@@ -275,6 +318,8 @@ pub enum Expr {
     Var(String),
     BinOp { left: Box<Expr>, op: Op, right: Box<Expr> },
     Call { func: String, args: Vec<Expr> },
+    GetAttr(Box<Expr>, String),
+    MethodCall(Box<Expr>, String, Vec<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -314,7 +359,11 @@ pub enum Statement {
     If(IfStmt),
     Assign(String, Expr),
     Expr(Expr),
-    Import(String), // NEW
+    Import(String),         // file-import: `import "path/to/file.ry"`
+    PyImport {              // python-import: `import math` or `import numpy as np`
+        alias: String,
+        module: String,
+    },
 }
 
 #[derive(Debug, Clone)]

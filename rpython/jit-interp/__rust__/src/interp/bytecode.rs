@@ -18,10 +18,28 @@ pub enum OpCode {
     Move,
     Call,
     Inc,
+    // Python interop opcodes ---------------------------------------------------
+    /// ImportPython dst, string_pool_idx
+    /// Load a Python module by name; store as PyObject in dst.
+    ImportPython,
+    /// GetAttr dst, obj_reg, string_pool_idx
+    /// Retrieve attribute `string_pool[imm]` from the PyObject in src1.
+    GetAttr,
+    /// CallPython dst, callable_reg, nargs
+    /// Call the PyObject in src1 with `src2` arguments placed in the
+    /// following consecutive registers (reg_base+dst+1 … +nargs).
+    /// Result (converted back to Value) is written to dst.
+    CallPython,
+    /// ConvertToPy dst, src
+    /// Convert a native Value (int/bool/string) in src to a Python object in dst.
+    ConvertToPy,
+    /// ConvertFromPy dst, src
+    /// Convert a PyObject in src back to the closest native Value.
+    ConvertFromPy,
 }
 
 #[derive(Clone, Copy)]
-pub struct Instruction(u32);
+pub struct Instruction(pub u32);
 
 impl Instruction {
     #[inline(always)]

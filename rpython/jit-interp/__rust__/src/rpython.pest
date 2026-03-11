@@ -2,13 +2,15 @@ program = { SOI ~ (statement)* ~ EOI }
 
 import_statement = { "import" ~ string ~ ";"? }
 
+py_import_statement = { "import" ~ identifier ~ ("as" ~ identifier)? ~ ";"? }
+
 function_def = {
     "def" ~ identifier ~ "(" ~ (param ~ ("," ~ param)*)? ~ ")" ~ "->" ~ type ~ block ~ ";"?
 }
 
-var_decl = { identifier ~ ":" ~ type ~ "=" ~ expr ~ ";" }
+var_decl = { identifier ~ ":" ~ type ~ "=" ~ expr ~ ";"? }
 
-return_statement = { "return" ~ expr ~ ";" }
+return_statement = { "return" ~ expr ~ ";"? }
 
 if_statement = {
     "if" ~ expr ~ block ~ ("else" ~ (if_statement | block))? ~ ";"?
@@ -16,11 +18,12 @@ if_statement = {
 
 while_statement = { "while" ~ expr ~ block ~ ";"? }
 
-assign_statement = { identifier ~ "=" ~ expr ~ ";" }
+assign_statement = { identifier ~ "=" ~ expr ~ ";"? }
 
 block = { "{" ~ (statement)* ~ "}" }
 
 statement = {
+    py_import_statement |
     import_statement |
     function_def |
     var_decl |
@@ -35,7 +38,16 @@ expr = { comp_expr }
 
 comp_expr = { add_expr ~ (comp ~ add_expr)* }
 add_expr  = { mul_expr ~ (add ~ mul_expr)* }
-mul_expr  = { primary ~ (mul ~ primary)* }
+mul_expr  = { dotcall ~ (mul ~ dotcall)* }
+
+// dotcall: a primary optionally followed by one or more .attr or .method(args) suffixes
+// e.g.  math.sqrt(x)   obj.attr   a.b(1).c(2)
+dotcall = {
+    primary ~ (
+        "." ~ identifier ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")"   // method call
+      | "." ~ identifier                                           // attribute get
+    )*
+}
 
 primary = {
     call |
@@ -52,7 +64,7 @@ var_ref = { identifier }
 
 param = { identifier ~ ":" ~ type }
 
-type = { "int" | "float" | "string" | "bool" | "nil" }
+type = { "int" | "float" | "string" | "bool" | "nil" | "pyobj" }
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 

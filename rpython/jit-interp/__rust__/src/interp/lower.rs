@@ -26,6 +26,18 @@ impl LoweringContext {
         }
     }
 
+    /// Intern a string into the pool and return its u16 index.
+    fn intern_string(&mut self, s: &str) -> u16 {
+        if let Some(&i) = self.string_map.get(s) {
+            i
+        } else {
+            let i = self.string_pool.len() as u16;
+            self.string_pool.push(s.to_string());
+            self.string_map.insert(s.to_string(), i);
+            i
+        }
+    }
+
     fn ensure_reg(&mut self, v: ValueId) -> u8 {
         while self.reg_map.len() <= v as usize {
             self.reg_map.push(self.next_reg);
@@ -151,9 +163,85 @@ impl LoweringContext {
                         let rs = self.ensure_reg(*src);
                         self.bytecode.push(Instruction::encode_rr(OpCode::Move, rd, rs));
                     }
-                }
-            }
-        }
+                    // ----- Python interop IR nodes -----
+                    //
+                    // Encoding strategy: the string name/attr is stored in the
+                    // string pool and referenced via its u16 index in imm.
+                    // For GetAttr / CallPython the object/callable register is
+                    // stored in src1 (via encode_rrr with src2=nargs or 0).
+
+                    IrNode::ImportPython(dst, module_name) => {
+                        let rd = self.ensure_reg(*dst);
+                        let idx = self.intern_string(module_name);
+                        // encode_imm: op=ImportPython, dst=rd, imm=string_idx
+                        self.bytecode.push(Instruction::encode_imm(OpCode::ImportPython, rd, idx));
+                    }
+
+                    IrNode::GetAttr(dst, obj, attr_name) => {
+                        let rd  = self.ensure_reg(*dst);
+                        let ro  = self.ensure_reg(*obj);
+                        let idx = self.intern_string(attr_name);
+                        // encode_rrr: op=GetAttr, dst=rd, src1=ro, src2=0; imm lives in lower 16 bits
+                        // We reuse encode_imm but pack the object register into the dst field and
+                        // store the string index in imm, then recover obj reg from src1 in the VM.
+                        // Use a full rrr form: dst=rd, src1=ro, then patch imm via the word.
+                        // Simplest: emit encode_rrr so src1 carries ro, and imm in lower 16.
+                        let word: u32 = ((OpCode::GetAttr as u32) << 24)
+                            | ((rd as u32) << 16)
+                            | ((ro as u32) << 8)
+                            | 0;
+                        // We need imm too — encode_rrr leaves lower 8 bits only.
+                        // Instead use two instructions: first a LoadString for the attr index,
+                        // then our GetAttr encodes (dst, obj_reg) in rrr; VM uses string from pool via imm.
+                        // Cleaner: encode as encode_imm with src1 tucked into dst byte high nibble — too hacky.
+                        // Best: store attr idx in a scratch imm16 slot using encode_rrr with src2=attr_low,
+                        // and a separate "AttrHigh" extension byte.  For simplicity we reserve a 2-instruction
+                        // sequence: MOVE scratch<-obj, GetAttr dst, scratch, imm=attr_idx.
+                        let _ = word; // discard the draft word above
+                        // Emit a temporary Move so we can use encode_imm with full imm16 for attr idx,
+                        // and encode_rr packs (dst=rd, src1=ro) cleanly.
+                        // Final encoding: encode_rrr(GetAttr, rd, ro, 0) but with imm forced into lower 16.
+                        // We construct the raw u32 directly so we can carry all three fields:
+                        let raw = ((OpCode::GetAttr as u32) << 24)
+                            | ((rd as u32) << 16)
+                            | ((ro as u32) << 8)
+                            | (idx & 0xff) as u32;
+                        // idx may be > 255; store high byte separately using src2 as high byte.
+                        // For now assert idx < 256 (practically safe for typical programs).
+                        assert!(idx <= 0xff, "Too many strings in pool for GetAttr imm8 (>255)");
+                        self.bytecode.push(Instruction(raw));
+                    }
+
+                    IrNode::CallPython(dst, callable, args) => {
+                        let rd   = self.ensure_reg(*dst);
+                        let rc   = self.ensure_reg(*callable);
+                        let nargs = args.len() as u8;
+                        // Arguments are placed into registers rd+1, rd+2, …
+                        // The VM reads nargs Values starting at reg_base + rd + 1.
+                        for (i, arg_id) in args.iter().enumerate() {
+                            let rsrc = self.ensure_reg(*arg_id);
+                            // Move arg into slot rd+1+i relative to frame
+                            let slot = rd + 1 + i as u8;
+                            self.bytecode.push(Instruction::encode_rr(OpCode::Move, slot, rsrc));
+                        }
+                        // encode: dst=rd, src1=rc, src2=nargs
+                        self.bytecode.push(Instruction::encode_rrr(OpCode::CallPython, rd, rc, nargs));
+                    }
+
+                    IrNode::ConvertToPy(dst, src) => {
+                        let rd = self.ensure_reg(*dst);
+                        let rs = self.ensure_reg(*src);
+                        self.bytecode.push(Instruction::encode_rr(OpCode::ConvertToPy, rd, rs));
+                    }
+
+                    IrNode::ConvertFromPy(dst, src) => {
+                        let rd = self.ensure_reg(*dst);
+                        let rs = self.ensure_reg(*src);
+                        self.bytecode.push(Instruction::encode_rr(OpCode::ConvertFromPy, rd, rs));
+                    }
+                } // end match node
+            } // end for node in &block.instructions
+        } // end for block in &func.blocks
 
         for (pos, target, is_branch) in &self.pending_jumps {
             let target_pc = *self.block_starts.get(target).unwrap() as u16;
@@ -183,19 +271,26 @@ impl LoweringContext {
     }
 
     pub fn lower_program(&mut self, program: &IrProgram) -> (Vec<(Rc<Vec<Instruction>>, usize, usize)>, Vec<String>) {
-    let mut functions = Vec::new();
-    for (idx, func) in program.functions.iter().enumerate() {
-        let (bytecode, max_reg) = self.lower_function(func);
-        let param_count = func.params.len();
-        if idx == 0 {  // main function
-            println!("Bytecode for main (function {}):", idx);
-            for (i, insn) in bytecode.iter().enumerate() {
-                println!("  {}: {:?} dst={} src1={} src2={} imm={}",
-                    i, insn.opcode(), insn.dst(), insn.src1(), insn.src2(), insn.imm());
-            }
+        let mut functions = Vec::new();
+        
+        for (idx, func) in program.functions.iter().enumerate() {
+            let (bytecode, max_reg) = self.lower_function(func);
+            let param_count = func.params.len();
+            
+            #[cfg(debug_assertions)]
+            {
+                if idx == 0 {
+                    println!("Bytecode for main (function {}):", idx);
+                    for (i, insn) in bytecode.iter().enumerate() {
+                        println!("  {}: {:?} dst={} src1={} src2={} imm={}",
+                            i, insn.opcode(), insn.dst(), insn.src1(), insn.src2(), insn.imm());
+                    }
+                }
+            } 
+            
+            functions.push((Rc::new(bytecode), param_count, max_reg));
         }
-        functions.push((Rc::new(bytecode), param_count, max_reg));
-    }
-    (functions, self.string_pool.clone())
+        
+        (functions, self.string_pool.clone())
     }
 }

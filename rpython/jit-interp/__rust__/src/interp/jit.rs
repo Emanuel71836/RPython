@@ -219,7 +219,14 @@ impl JitCompiler {
 // pre-flight checks
 
     fn has_unsupported_opcodes(bytecode: &[Instruction]) -> bool {
-        bytecode.iter().any(|i| matches!(i.opcode(), OpCode::LoadString))
+        bytecode.iter().any(|i| matches!(i.opcode(),
+            OpCode::LoadString
+            | OpCode::ImportPython
+            | OpCode::GetAttr
+            | OpCode::CallPython
+            | OpCode::ConvertToPy
+            | OpCode::ConvertFromPy
+        ))
     }
 
     fn validate_jump_targets(bytecode: &[Instruction]) -> bool {
@@ -689,6 +696,15 @@ impl JitCompiler {
                         let one = builder.ins().iconst(types::I64, 1i64);
                         let inc = builder.ins().iadd(raw, one);
                         write_raw!(d, inc);
+                    }
+                    // Python interop opcodes are excluded by has_unsupported_opcodes()
+                    // so these arms should never be reached in practice.
+                    OpCode::ImportPython
+                    | OpCode::GetAttr
+                    | OpCode::CallPython
+                    | OpCode::ConvertToPy
+                    | OpCode::ConvertFromPy => {
+                        unreachable!("Python interop opcode {:?} should have been caught by pre-flight check", op);
                     }
                 }
 

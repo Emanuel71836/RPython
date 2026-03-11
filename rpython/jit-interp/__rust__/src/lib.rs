@@ -50,6 +50,13 @@ fn convert_expr(expr: parser::Expr) -> FrontendExpr {
             let args = args.into_iter().map(convert_expr).collect();
             FrontendExpr::Call(func, args)
         }
+        parser::Expr::GetAttr(obj, attr) => {
+            FrontendExpr::GetAttr(Box::new(convert_expr(*obj)), attr)
+        }
+        parser::Expr::MethodCall(obj, method, args) => {
+            let args = args.into_iter().map(convert_expr).collect();
+            FrontendExpr::MethodCall(Box::new(convert_expr(*obj)), method, args)
+        }
     }
 }
 
@@ -89,6 +96,10 @@ fn convert_statement(stmt: parser::Statement) -> FrontendStmt {
         }
         parser::Statement::FunctionDef(_) => panic!("Function def not expected here"),
         parser::Statement::Import(_) => panic!("Import should have been resolved earlier"),
+        parser::Statement::PyImport { alias, module } => {
+            // translate to a frontend PyImport statement which CodeGen handles
+            FrontendStmt::PyImport(alias, module)
+        }
     }
 }
 
@@ -129,6 +140,9 @@ fn collect_functions_from_file(
                 let full_path = dir.join(&import_path);
                 imports.push(full_path.to_string_lossy().to_string());
             }
+            parser::Statement::PyImport { .. } => {
+                // python imports are handled at runtime by the VM; skip here
+            }
             _ => {}
         }
     }
@@ -154,6 +168,9 @@ pub fn compile_file(filename: &str) -> Result<String, String> {
     for stmt in program.body {
         match stmt {
             parser::Statement::FunctionDef(_) | parser::Statement::Import(_) => {}
+            parser::Statement::PyImport { alias, module } => {
+                main_statements.push(FrontendStmt::PyImport(alias, module));
+            }
             other => main_statements.push(convert_statement(other)),
         }
     }
