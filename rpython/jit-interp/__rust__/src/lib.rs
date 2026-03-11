@@ -220,7 +220,7 @@ fn compile_to_native(py: Python, code: &str) -> PyResult<String> {
 #[pyfunction]
 fn compile_file_py(py: Python, filename: &str) -> PyResult<String> {
     py.allow_threads(|| {
-        compile_file(filename).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+        compile_file(filename).map_err(pyo3::exceptions::PyValueError::new_err)
     })
 }
 
@@ -250,7 +250,7 @@ fn compile_many(py: Python, codes: Vec<String>) -> PyResult<Vec<String>> {
         }).collect()
     });
     results.into_iter().collect::<Result<Vec<String>, String>>()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
 #[pyfunction]

@@ -701,12 +701,9 @@ pub unsafe extern "C" fn ry_call_function(
     while pc < bytecode.len() {
         let insn = bytecode[pc];
         pc += 1;
-        match insn.opcode() {
-            OpCode::Return => {
-                let reg = insn.dst() as usize;
-                return registers[reg];
-            }
-            _ => {}
+        if insn.opcode() == OpCode::Return {
+            let reg = insn.dst() as usize;
+            return registers[reg];
         }
     }
     Value::nil()

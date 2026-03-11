@@ -163,12 +163,6 @@ impl LoweringContext {
                         let rs = self.ensure_reg(*src);
                         self.bytecode.push(Instruction::encode_rr(OpCode::Move, rd, rs));
                     }
-                    // ----- Python interop IR nodes -----
-                    //
-                    // Encoding strategy: the string name/attr is stored in the
-                    // string pool and referenced via its u16 index in imm.
-                    // For GetAttr / CallPython the object/callable register is
-                    // stored in src1 (via encode_rrr with src2=nargs or 0).
 
                     IrNode::ImportPython(dst, module_name) => {
                         let rd = self.ensure_reg(*dst);
@@ -181,33 +175,14 @@ impl LoweringContext {
                         let rd  = self.ensure_reg(*dst);
                         let ro  = self.ensure_reg(*obj);
                         let idx = self.intern_string(attr_name);
-                        // encode_rrr: op=GetAttr, dst=rd, src1=ro, src2=0; imm lives in lower 16 bits
-                        // We reuse encode_imm but pack the object register into the dst field and
-                        // store the string index in imm, then recover obj reg from src1 in the VM.
-                        // Use a full rrr form: dst=rd, src1=ro, then patch imm via the word.
-                        // Simplest: emit encode_rrr so src1 carries ro, and imm in lower 16.
                         let word: u32 = ((OpCode::GetAttr as u32) << 24)
                             | ((rd as u32) << 16)
-                            | ((ro as u32) << 8)
-                            | 0;
-                        // We need imm too — encode_rrr leaves lower 8 bits only.
-                        // Instead use two instructions: first a LoadString for the attr index,
-                        // then our GetAttr encodes (dst, obj_reg) in rrr; VM uses string from pool via imm.
-                        // Cleaner: encode as encode_imm with src1 tucked into dst byte high nibble — too hacky.
-                        // Best: store attr idx in a scratch imm16 slot using encode_rrr with src2=attr_low,
-                        // and a separate "AttrHigh" extension byte.  For simplicity we reserve a 2-instruction
-                        // sequence: MOVE scratch<-obj, GetAttr dst, scratch, imm=attr_idx.
+                            | ((ro as u32) << 8);x.
                         let _ = word; // discard the draft word above
-                        // Emit a temporary Move so we can use encode_imm with full imm16 for attr idx,
-                        // and encode_rr packs (dst=rd, src1=ro) cleanly.
-                        // Final encoding: encode_rrr(GetAttr, rd, ro, 0) but with imm forced into lower 16.
-                        // We construct the raw u32 directly so we can carry all three fields:
                         let raw = ((OpCode::GetAttr as u32) << 24)
                             | ((rd as u32) << 16)
                             | ((ro as u32) << 8)
                             | (idx & 0xff) as u32;
-                        // idx may be > 255; store high byte separately using src2 as high byte.
-                        // For now assert idx < 256 (practically safe for typical programs).
                         assert!(idx <= 0xff, "Too many strings in pool for GetAttr imm8 (>255)");
                         self.bytecode.push(Instruction(raw));
                     }

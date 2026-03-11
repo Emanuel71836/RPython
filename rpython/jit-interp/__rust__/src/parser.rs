@@ -73,7 +73,7 @@ impl rpythonParser {
 
     fn dotcall(node: Node) -> Result<Expr> {
         let mut all: Vec<Node> = node.into_children().collect();
-        let mut idx = 0;
+        let _idx = 0;
 
         // first child is always primary
         let mut res = Self::primary(all.remove(0))?;
