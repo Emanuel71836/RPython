@@ -695,7 +695,7 @@ impl CodeGen {
             }
             Expr::Call(name, args) => {
                 if let Some(&func_id) = self.func_index.get(name) {
-                    // Known user-defined function — emit a native Call
+                    // Known user-defined function,emit a native Call
                     let mut arg_vals = Vec::new();
                     for arg in args {
                         arg_vals.push(self.gen_expr(arg));
@@ -704,7 +704,7 @@ impl CodeGen {
                     self.add_insn(IrNode::Call(dst, func_id, arg_vals));
                     dst
                 } else if let Some(&var_id) = self.symbols.get(name) {
-                    // Variable in scope — treat as Python callable
+                    // Variable in scope,treat as Python callable
                     let mut arg_vals = Vec::new();
                     for arg in args {
                         arg_vals.push(self.gen_expr(arg));
