@@ -163,6 +163,12 @@ impl LoweringContext {
                         let rs = self.ensure_reg(*src);
                         self.bytecode.push(Instruction::encode_rr(OpCode::Move, rd, rs));
                     }
+                    // ----- Python interop IR nodes -----
+                    //
+                    // Encoding strategy: the string name/attr is stored in the
+                    // string pool and referenced via its u16 index in imm.
+                    // For GetAttr / CallPython the object/callable register is
+                    // stored in src1 (via encode_rrr with src2=nargs or 0).
 
                     IrNode::ImportPython(dst, module_name) => {
                         let rd = self.ensure_reg(*dst);
@@ -175,14 +181,19 @@ impl LoweringContext {
                         let rd  = self.ensure_reg(*dst);
                         let ro  = self.ensure_reg(*obj);
                         let idx = self.intern_string(attr_name);
-                        let word: u32 = ((OpCode::GetAttr as u32) << 24)
-                            | ((rd as u32) << 16)
-                            | ((ro as u32) << 8);x.
-                        let _ = word; // discard the draft word above
+                        // encode_rrr: op=GetAttr, dst=rd, src1=ro, src2=0; imm lives in lower 16 bits
+                        // We reuse encode_imm but pack the object register into the dst field and
+                        // store the string index in imm, then recover obj reg from src1 in the VM.
+                        // Use a full rrr form: dst=rd, src1=ro, then patch imm via the word.
+                        // Simplest: emit encode_rrr so src1 carries ro, and imm in lower 16.
+                        // Encoding: op[31:24] | dst[23:16] | obj_reg[15:8] | attr_idx[7:0]
+                        // attr_idx is asserted < 256 below.
                         let raw = ((OpCode::GetAttr as u32) << 24)
                             | ((rd as u32) << 16)
                             | ((ro as u32) << 8)
                             | (idx & 0xff) as u32;
+                        // idx may be > 255; store high byte separately using src2 as high byte.
+                        // For now assert idx < 256 (practically safe for typical programs).
                         assert!(idx <= 0xff, "Too many strings in pool for GetAttr imm8 (>255)");
                         self.bytecode.push(Instruction(raw));
                     }
@@ -231,41 +242,25 @@ impl LoweringContext {
             self.bytecode[*pos] = new_insn;
         }
 
-        // Apply peephole optimizations
-        let optimized = self.bytecode.clone(); 
-
-        if cfg!(debug_assertions) && func.name == "main" {  // assuming func has a name field
-        println!("Bytecode for main:");
-        for (i, insn) in optimized.iter().enumerate() {
-            println!("  {}: {:?} dst={} src1={} src2={} imm={}", 
-                i, insn.opcode(), insn.dst(), insn.src1(), insn.src2(), insn.imm());
+        let optimized = self.bytecode.clone();
+        #[cfg(debug_assertions)]
+        if func.name == "main" {
+            println!("Bytecode for {}:", func.name);
+            for (i, insn) in optimized.iter().enumerate() {
+                println!("  {}: {:?} dst={} src1={} src2={} imm={}",
+                    i, insn.opcode(), insn.dst(), insn.src1(), insn.src2(), insn.imm());
+            }
         }
-    }
-
         (optimized, self.next_reg as usize)
     }
 
     pub fn lower_program(&mut self, program: &IrProgram) -> (Vec<(Rc<Vec<Instruction>>, usize, usize)>, Vec<String>) {
-        let mut functions = Vec::new();
-        
-        for (idx, func) in program.functions.iter().enumerate() {
-            let (bytecode, max_reg) = self.lower_function(func);
-            let param_count = func.params.len();
-            
-            #[cfg(debug_assertions)]
-            {
-                if idx == 0 {
-                    println!("Bytecode for main (function {}):", idx);
-                    for (i, insn) in bytecode.iter().enumerate() {
-                        println!("  {}: {:?} dst={} src1={} src2={} imm={}",
-                            i, insn.opcode(), insn.dst(), insn.src1(), insn.src2(), insn.imm());
-                    }
-                }
-            } 
-            
-            functions.push((Rc::new(bytecode), param_count, max_reg));
-        }
-        
-        (functions, self.string_pool.clone())
+    let mut functions = Vec::new();
+    for (_idx, func) in program.functions.iter().enumerate() {
+        let (bytecode, max_reg) = self.lower_function(func);
+        let param_count = func.params.len();
+        functions.push((Rc::new(bytecode), param_count, max_reg));
+    }
+    (functions, self.string_pool.clone())
     }
 }

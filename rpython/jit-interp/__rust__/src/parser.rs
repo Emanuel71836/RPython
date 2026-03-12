@@ -58,10 +58,15 @@ impl rpythonParser {
         Ok(Expr::Call { func: name, args })
     }
 
+    fn boolean(node: Node) -> Result<Expr> {
+        Ok(Expr::Bool(node.as_str() == "true"))
+    }
+
     fn primary(node: Node) -> Result<Expr> {
         let child = node.into_children().next().unwrap();
         match child.as_rule() {
             Rule::call => Self::call(child),
+            Rule::boolean => Self::boolean(child),
             Rule::var_ref => Self::var_ref(child),
             Rule::number => Ok(Expr::Number(Self::number(child)?)),
             Rule::float => Ok(Expr::Float(Self::float(child)?)),
@@ -71,30 +76,41 @@ impl rpythonParser {
         }
     }
 
+    // dot_method = { "." ~ identifier ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+    // Returns (method_name, args)
+    fn dot_method(node: Node) -> Result<(String, Vec<Expr>)> {
+        let mut children = node.into_children();
+        let name = Self::identifier(children.next().unwrap())?;
+        let args = children
+            .filter(|c| c.as_rule() == Rule::expr)
+            .map(|c| Self::expr(c))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((name, args))
+    }
+
+    // dot_attr = { "." ~ identifier }
+    // Returns the attribute name
+    fn dot_attr(node: Node) -> Result<String> {
+        let mut children = node.into_children();
+        Self::identifier(children.next().unwrap())
+    }
+
     fn dotcall(node: Node) -> Result<Expr> {
-        let mut all: Vec<Node> = node.into_children().collect();
-        let _idx = 0;
-
-        // first child is always primary
-        let mut res = Self::primary(all.remove(0))?;
-
-        // process remaining children as dot-suffix tokens
-        while !all.is_empty() {
-            // ext must be an identifier (the attr / method name)
-            let name_node = all.remove(0);
-            let name = Self::identifier(name_node)?;
-
-            // Collect consecutive expr children as method arguments
-            let mut args: Vec<Expr> = Vec::new();
-            while !all.is_empty() && all[0].as_rule() == Rule::expr {
-                let expr_node = all.remove(0);
-                args.push(Self::expr(expr_node)?);
-            }
-
-            res = if args.is_empty() {
-                Expr::GetAttr(Box::new(res), name)
-            } else {
-                Expr::MethodCall(Box::new(res), name, args)
+        let mut children = node.into_children();
+        // First child is always primary
+        let mut res = Self::primary(children.next().unwrap())?;
+        // Remaining children are dot_method or dot_attr suffixes
+        for suffix in children {
+            res = match suffix.as_rule() {
+                Rule::dot_method => {
+                    let (name, args) = Self::dot_method(suffix)?;
+                    Expr::MethodCall(Box::new(res), name, args)
+                }
+                Rule::dot_attr => {
+                    let name = Self::dot_attr(suffix)?;
+                    Expr::GetAttr(Box::new(res), name)
+                }
+                _ => unreachable!(),
             };
         }
         Ok(res)
@@ -315,6 +331,7 @@ pub enum Expr {
     Number(i64),
     Float(f64),
     String(String),
+    Bool(bool),
     Var(String),
     BinOp { left: Box<Expr>, op: Op, right: Box<Expr> },
     Call { func: String, args: Vec<Expr> },

@@ -109,6 +109,7 @@ impl<'a> Lexer<'a> {
 #[derive(Debug)]
 pub enum Expr {
     Number(i64),
+    Bool(bool),
     String(String),
     Variable(String),
     Assign(String, Box<Expr>),
@@ -645,6 +646,11 @@ impl CodeGen {
                 self.add_insn(IrNode::Const(v, Constant::Int(*n)));
                 v
             }
+            Expr::Bool(b) => {
+                let v = self.new_value();
+                self.add_insn(IrNode::Const(v, Constant::Bool(*b)));
+                v
+            }
             Expr::String(s) => {
                 let v = self.new_value();
                 self.add_insn(IrNode::Const(v, Constant::String(s.clone())));
@@ -695,7 +701,7 @@ impl CodeGen {
             }
             Expr::Call(name, args) => {
                 if let Some(&func_id) = self.func_index.get(name) {
-                    // Known user-defined function,emit a native Call
+                    // Known user-defined function — emit a native Call
                     let mut arg_vals = Vec::new();
                     for arg in args {
                         arg_vals.push(self.gen_expr(arg));
@@ -704,7 +710,7 @@ impl CodeGen {
                     self.add_insn(IrNode::Call(dst, func_id, arg_vals));
                     dst
                 } else if let Some(&var_id) = self.symbols.get(name) {
-                    // Variable in scope,treat as Python callable
+                    // Variable in scope — treat as Python callable
                     let mut arg_vals = Vec::new();
                     for arg in args {
                         arg_vals.push(self.gen_expr(arg));

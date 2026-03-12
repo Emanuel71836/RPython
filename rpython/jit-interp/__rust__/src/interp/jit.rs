@@ -109,7 +109,7 @@ impl JitCompiler {
         t1_flags.set("enable_verifier",  "false").unwrap();
         let t1_flags = settings::Flags::new(t1_flags);
 
-// detect the host architecture name at compile time so can look up
+// detect the host architecture name at compile time so we can look up
 // the right ISA backend.  cranelift_codegen::isa::lookup_by_name accepts
 // the same strings as `target_triple` (e.g. "x86_64", "aarch64")
         let host_arch = std::env::consts::ARCH;  // "x86_64", "aarch64", …
@@ -178,7 +178,7 @@ impl JitCompiler {
             };
 
         if cfg!(debug_assertions) {
-            println!("[JIT] func_{}: {} calls  {:?} → {:?}", func_idx, count, current_tier, target_tier);
+            if cfg!(debug_assertions) { println!("[JIT] func_{}: {} calls  {:?} → {:?}", func_idx, count, current_tier, target_tier); }
         }
 
         if Self::has_unsupported_opcodes(bytecode) || !Self::validate_jump_targets(bytecode) {
@@ -208,7 +208,7 @@ impl JitCompiler {
         }
 
         if cfg!(debug_assertions) {
-            println!("[JIT] func_{}: compile_immediately → Baseline", func_idx);
+            if cfg!(debug_assertions) { println!("[JIT] func_{}: compile_immediately → Baseline", func_idx); }
         }
 
         let fn_ptr = self.compile_inner(func_idx, bytecode, num_params, num_regs, Tier::Baseline)?;
@@ -265,7 +265,7 @@ impl JitCompiler {
     ) -> Option<NativeFunc> {
         let tier_tag = match tier { Tier::Baseline => "t1", Tier::Optimized => "t2", _ => return None };
         if cfg!(debug_assertions) {
-            println!("[JIT] func_{} bytecode ({} insns, {} regs):", func_idx, bytecode.len(), num_regs);
+            if cfg!(debug_assertions) { println!("[JIT] func_{} bytecode ({} insns, {} regs):", func_idx, bytecode.len(), num_regs); }
             for (i, insn) in bytecode.iter().enumerate() {
                 println!("  {}: {:?} dst={} src1={} src2={} imm={}",
                     i, insn.opcode(), insn.dst(), insn.src1(), insn.src2(), insn.imm());
@@ -664,6 +664,7 @@ impl JitCompiler {
                     OpCode::Move => {
                         let s = insn.src1() as usize;
                         let d = insn.dst() as usize;
+// propagate raw flag so we don't box/unbox unnecessarily
                         if let Some(v) = cache[s] {
                             cache[d]  = Some(v);
                             is_raw[d] = is_raw[s];
@@ -677,6 +678,10 @@ impl JitCompiler {
                     OpCode::Call => {
 // flush live values so ry_jit_call can read args from regs_ptr
                         flush_for_call!();
+// also write any values that ry_jit_call's callee needs to see
+// (args are placed at regs[0..num_params] by preceding Move insns)
+// after the call, invalidate cache (callee may have side-effects
+// on regs_ptr... it doesn't, but we reload the result anyway)
                         cache.iter_mut().for_each(|c| *c = None);
                         dirty.iter_mut().for_each(|d| *d = false);
                         let callee_imm = builder.ins().iconst(types::I64, insn.imm() as i64);
@@ -735,7 +740,7 @@ impl JitCompiler {
         let code_ptr = module.get_finalized_function(func_id);
 
         if cfg!(debug_assertions) {
-            println!("[JIT] func_{} compiled {:?} @ {:p}", func_idx, tier, code_ptr);
+            if cfg!(debug_assertions) { println!("[JIT] func_{} compiled {:?} @ {:p}", func_idx, tier, code_ptr); }
         }
 
         Some(unsafe { mem::transmute(code_ptr) })

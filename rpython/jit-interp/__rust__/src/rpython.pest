@@ -2,6 +2,7 @@ program = { SOI ~ (statement)* ~ EOI }
 
 import_statement = { "import" ~ string ~ ";"? }
 
+// Python-style import: `import math` or `import numpy as np`
 py_import_statement = { "import" ~ identifier ~ ("as" ~ identifier)? ~ ";"? }
 
 function_def = {
@@ -40,17 +41,16 @@ comp_expr = { add_expr ~ (comp ~ add_expr)* }
 add_expr  = { mul_expr ~ (add ~ mul_expr)* }
 mul_expr  = { dotcall ~ (mul ~ dotcall)* }
 
-// dotcall: a primary optionally followed by one or more .attr or .method(args) suffixes
-// e.g.  math.sqrt(x)   obj.attr   a.b(1).c(2)
-dotcall = {
-    primary ~ (
-        "." ~ identifier ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")"   // method call
-      | "." ~ identifier                                           // attribute get
-    )*
-}
+// dotcall suffixes: named rules so the parser can distinguish .foo() from .foo
+dot_method = { "." ~ identifier ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+dot_attr   = { "." ~ identifier }
+dotcall    = { primary ~ (dot_method | dot_attr)* }
+
+boolean = { "true" | "false" }
 
 primary = {
     call |
+    boolean |
     var_ref |
     number |
     float |

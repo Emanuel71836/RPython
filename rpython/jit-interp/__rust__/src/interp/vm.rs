@@ -275,9 +275,6 @@ impl VM {
                 OpCode::LoadConst => {
                     let dst = frame.reg_base + insn.dst() as usize;
                     let imm = insn.imm() as i64;
-                    if cfg!(debug_assertions) && frame.func_idx == 0 {
-                        println!("main LoadConst: imm={}, dst_reg={}", imm, insn.dst());
-                    }
                     self.register_pool[dst] = Value::from_int(imm);
                 }
                 OpCode::LoadBool => {
@@ -334,7 +331,22 @@ impl VM {
                 }
                 OpCode::Print => {
                     let reg = frame.reg_base + insn.dst() as usize;
-                    println!("{:?}", self.register_pool[reg]);
+                    let val = self.register_pool[reg];
+                    if val.is_pyobject() {
+                        // Ask Python to stringify — bind the raw ptr, call __str__
+                        pyo3::Python::with_gil(|py| {
+                            if let Some(raw) = val.to_pyobject() {
+                                let obj = unsafe { pyo3::PyObject::from_borrowed_ptr(py, raw) };
+                                let bound = obj.bind(py);
+                                let s = bound.str()
+                                    .map(|ps| ps.to_string())
+                                    .unwrap_or_else(|_| "<PyObject>".to_string());
+                                println!("{}", s);
+                            }
+                        });
+                    } else {
+                        println!("{:?}", val);
+                    }
                 }
                 OpCode::Move => {
                     let dst = frame.reg_base + insn.dst() as usize;
@@ -652,6 +664,9 @@ pub unsafe extern "C" fn ry_jit_call(
                 let r = insn.dst() as usize;
                 registers[r] = registers[r] + Value::from_int(1);
             }
+            // Python interop opcodes are not reachable via the JIT slow path
+            // (the JIT defers to the main VM loop for these). If somehow hit,
+            // panic with a clear message rather than silently miscompiling.
             OpCode::ImportPython | OpCode::GetAttr | OpCode::CallPython
             | OpCode::ConvertToPy | OpCode::ConvertFromPy => {
                 panic!("Python interop opcode {:?} encountered in JIT slow-path interpreter; \
@@ -701,9 +716,12 @@ pub unsafe extern "C" fn ry_call_function(
     while pc < bytecode.len() {
         let insn = bytecode[pc];
         pc += 1;
-        if insn.opcode() == OpCode::Return {
-            let reg = insn.dst() as usize;
-            return registers[reg];
+        match insn.opcode() {
+            OpCode::Return => {
+                let reg = insn.dst() as usize;
+                return registers[reg];
+            }
+            _ => {}
         }
     }
     Value::nil()

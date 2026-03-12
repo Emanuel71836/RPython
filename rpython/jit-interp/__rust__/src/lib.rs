@@ -31,6 +31,7 @@ fn convert_expr(expr: parser::Expr) -> FrontendExpr {
     match expr {
         parser::Expr::Number(n) => FrontendExpr::Number(n),
         parser::Expr::Float(f) => FrontendExpr::Number(f as i64),
+        parser::Expr::Bool(b) => FrontendExpr::Bool(b),
         parser::Expr::String(s) => FrontendExpr::String(s),
         parser::Expr::Var(name) => FrontendExpr::Variable(name),
         parser::Expr::BinOp { left, op, right } => {
@@ -97,7 +98,7 @@ fn convert_statement(stmt: parser::Statement) -> FrontendStmt {
         parser::Statement::FunctionDef(_) => panic!("Function def not expected here"),
         parser::Statement::Import(_) => panic!("Import should have been resolved earlier"),
         parser::Statement::PyImport { alias, module } => {
-            // translate to a frontend PyImport statement which CodeGen handles
+            // Translate to a frontend PyImport statement which CodeGen handles
             FrontendStmt::PyImport(alias, module)
         }
     }
@@ -141,7 +142,7 @@ fn collect_functions_from_file(
                 imports.push(full_path.to_string_lossy().to_string());
             }
             parser::Statement::PyImport { .. } => {
-                // python imports are handled at runtime by the VM; skip here
+                // Python imports are handled at runtime by the VM; skip here.
             }
             _ => {}
         }
@@ -171,9 +172,12 @@ pub fn compile_file(filename: &str) -> Result<String, String> {
             parser::Statement::PyImport { alias, module } => {
                 main_statements.push(FrontendStmt::PyImport(alias, module));
             }
-            other => main_statements.push(convert_statement(other)),
+            other => {
+                main_statements.push(convert_statement(other));
+            }
         }
     }
+    if cfg!(debug_assertions) { eprintln!("[compile_file] main_statements: {}", main_statements.len()); }
 
     let mut codegen = CodeGen::new();
     let ir_program = codegen.generate(functions, main_statements);
@@ -188,39 +192,54 @@ pub fn compile_file(filename: &str) -> Result<String, String> {
 }
 
 #[pyfunction]
-fn compile_to_native(py: Python, code: &str) -> PyResult<String> {
-    py.allow_threads(|| {
-        let program = parser::parse_rpython_code(code)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Parse error: {}", e)))?;
-        let mut funcs = Vec::new();
-        let mut main_stmts = Vec::new();
-        for stmt in program.body {
-            match stmt {
-                parser::Statement::FunctionDef(f) => funcs.push(convert_function_def(f)),
-                parser::Statement::Import(_) => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "import not supported in compile_to_native; use compile_file_py instead".to_string()
-                    ));
-                }
-                other => main_stmts.push(convert_statement(other)),
+fn compile_to_native(_py: Python, code: &str) -> PyResult<String> {
+    // Parse first (pure Rust, no GIL needed)
+    let program = parser::parse_rpython_code(code)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Parse error: {}", e)))?;
+
+    let mut funcs = Vec::new();
+    let mut main_stmts = Vec::new();
+    let mut has_python_interop = false;
+
+    for stmt in program.body {
+        match stmt {
+            parser::Statement::FunctionDef(f) => funcs.push(convert_function_def(f)),
+            parser::Statement::Import(_) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "file import not supported in compile_to_native; use compile_file_py instead".to_string()
+                ));
+            }
+            parser::Statement::PyImport { alias, module } => {
+                has_python_interop = true;
+                main_stmts.push(FrontendStmt::PyImport(alias, module));
+            }
+            other => {
+                main_stmts.push(convert_statement(other));
             }
         }
-        let mut codegen = CodeGen::new();
-        let ir_program = codegen.generate(funcs, main_stmts);
-        let mut lower_ctx = LoweringContext::new();
-        let (functions, string_pool) = lower_ctx.lower_program(&ir_program);
-        let mut vm = VM::new(functions, string_pool, 1024 * 1024, unsafe { JIT_THRESHOLD }, 1024);
-        match vm.run() {
-            Ok(val) => Ok(format!("{:?}", val)),
-            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-        }
-    })
+    }
+    if cfg!(debug_assertions) { eprintln!("[compile_to_native] main_stmts: {}", main_stmts.len()); }
+
+    let mut codegen = CodeGen::new();
+    let ir_program = codegen.generate(funcs, main_stmts);
+    let mut lower_ctx = LoweringContext::new();
+    let (functions, string_pool) = lower_ctx.lower_program(&ir_program);
+    let mut vm = VM::new(functions, string_pool, 1024 * 1024, unsafe { JIT_THRESHOLD }, 1024);
+
+    // VM contains Rc<> and raw pointers so it is !Send — cannot use allow_threads.
+    // For pure-Rust programs this means we hold the GIL while running, which is
+    // acceptable for a JIT interpreter. For Python-interop programs the VM must
+    // hold the GIL anyway (it re-acquires per-opcode via with_gil).
+    let _ = has_python_interop; // suppress unused warnings
+    vm.run()
+        .map(|val| format!("{:?}", val))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
 #[pyfunction]
 fn compile_file_py(py: Python, filename: &str) -> PyResult<String> {
     py.allow_threads(|| {
-        compile_file(filename).map_err(pyo3::exceptions::PyValueError::new_err)
+        compile_file(filename).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
     })
 }
 
@@ -236,7 +255,10 @@ fn compile_many(py: Python, codes: Vec<String>) -> PyResult<Vec<String>> {
                 match stmt {
                     parser::Statement::FunctionDef(f) => funcs.push(convert_function_def(f)),
                     parser::Statement::Import(_) => {
-                        return Err("import not supported in compile_many".to_string());
+                        return Err("file import not supported in compile_many".to_string());
+                    }
+                    parser::Statement::PyImport { alias, module } => {
+                        main_stmts.push(FrontendStmt::PyImport(alias, module));
                     }
                     other => main_stmts.push(convert_statement(other)),
                 }
@@ -250,7 +272,7 @@ fn compile_many(py: Python, codes: Vec<String>) -> PyResult<Vec<String>> {
         }).collect()
     });
     results.into_iter().collect::<Result<Vec<String>, String>>()
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 
 #[pyfunction]
