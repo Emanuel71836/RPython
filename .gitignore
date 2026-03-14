@@ -1,14 +1,14 @@
 # Rust
-rpython/jit/__rust__/target/
-rpython/hand_test/__pycache__/
-rpython/tests/__pycache__/
+python_rs/jit/__rust__/target/
+python_rs/hand_test/__pycache__/
+python_rs/tests/__pycache__/
 # Parser output
-rpython/parser/parser.out
-rpython/parser/parsetab.py
-rpython/parser/*.out
-rpython/parser/parsetab.*
-rpython/.venv
-rpython/jit-interp/__rust__/target
+python_rs/parser/parser.out
+python_rs/parser/parsetab.py
+python_rs/parser/*.out
+python_rs/parser/parsetab.*
+python_rs/.venv
+python_rs/jit-interp/__rust__/target
 *.pyc
 *.so
 *.pyd

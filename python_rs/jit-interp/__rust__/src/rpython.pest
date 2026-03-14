@@ -1,0 +1,127 @@
+// ─── python_rs grammar — full Python syntax ────────────────────────────────────
+// Uses INDENT / DEDENT emulation via explicit indentation tracking.
+// For simplicity we use a line-oriented model: each logical line is parsed
+// and blocks are delimited by Python-style colon + indented body.
+// The lexer (rustpython-parser) handles the heavy lifting; this grammar is
+// kept only for reference and is no longer the primary parse path.
+// See parser.rs which now delegates to rustpython-parser directly.
+
+program = { SOI ~ statement* ~ EOI }
+
+// ── imports ──────────────────────────────────────────────────────────────────
+import_statement        = { "import" ~ dotted_name ~ NEWLINE }
+from_import_statement   = { "from" ~ dotted_name ~ "import" ~ (import_names | "*") ~ NEWLINE }
+import_names            = { identifier ~ ("," ~ identifier)* }
+dotted_name             = { identifier ~ ("." ~ identifier)* }
+
+// ── top-level statements ─────────────────────────────────────────────────────
+statement = {
+    function_def      |
+    class_def         |
+    import_statement  |
+    from_import_statement |
+    if_statement      |
+    while_statement   |
+    for_statement     |
+    return_statement  |
+    assign_statement  |
+    aug_assign        |
+    expr_statement
+}
+
+// ── function / class ─────────────────────────────────────────────────────────
+function_def = {
+    decorator* ~
+    "def" ~ identifier ~ "(" ~ param_list? ~ ")" ~ type_hint? ~ ":" ~ suite
+}
+decorator    = { "@" ~ dotted_name ~ NEWLINE }
+param_list   = { param ~ ("," ~ param)* ~ ","? }
+param        = { identifier ~ type_hint? ~ default_val? }
+type_hint    = { ":" ~ expr }
+default_val  = { "=" ~ expr }
+
+class_def    = { "class" ~ identifier ~ ("(" ~ expr? ~ ")")? ~ ":" ~ suite }
+
+suite        = { NEWLINE ~ INDENT ~ statement+ ~ DEDENT
+               | simple_stmt }
+simple_stmt  = { (return_statement | assign_statement | aug_assign | expr_statement) }
+
+// ── control flow ─────────────────────────────────────────────────────────────
+if_statement     = { "if" ~ expr ~ ":" ~ suite ~
+                     ("elif" ~ expr ~ ":" ~ suite)* ~
+                     ("else" ~ ":" ~ suite)? }
+while_statement  = { "while" ~ expr ~ ":" ~ suite }
+for_statement    = { "for" ~ identifier ~ "in" ~ expr ~ ":" ~ suite }
+return_statement = { "return" ~ expr? ~ NEWLINE }
+
+// ── assignments ───────────────────────────────────────────────────────────────
+assign_statement = { target ~ "=" ~ expr ~ NEWLINE }
+aug_assign       = { identifier ~ aug_op ~ expr ~ NEWLINE }
+aug_op           = { "+=" | "-=" | "*=" | "/=" | "//=" | "%=" }
+target           = { identifier ~ ("." ~ identifier | "[" ~ expr ~ "]")* }
+
+// ── expressions (operator precedence) ────────────────────────────────────────
+expr_statement = { expr ~ NEWLINE }
+
+expr       = { or_expr }
+or_expr    = { and_expr  ~ ("or"  ~ and_expr)* }
+and_expr   = { not_expr  ~ ("and" ~ not_expr)* }
+not_expr   = { "not" ~ not_expr | cmp_expr }
+cmp_expr   = { add_expr  ~ (cmp_op ~ add_expr)* }
+add_expr   = { mul_expr  ~ (add_op ~ mul_expr)* }
+mul_expr   = { unary     ~ (mul_op ~ unary)*   }
+unary      = { "-" ~ unary | "+" ~ unary | postfix }
+postfix    = { primary ~ postfix_op* }
+postfix_op = { method_call | subscript | field_access }
+
+method_call  = { "." ~ identifier ~ "(" ~ arg_list? ~ ")" }
+subscript    = { "[" ~ expr ~ "]" }
+field_access = { "." ~ identifier }
+arg_list     = { expr ~ ("," ~ expr)* ~ ","? }
+
+primary = {
+    "(" ~ expr ~ ")"    |
+    list_literal        |
+    dict_literal        |
+    lambda_expr         |
+    bool_lit            |
+    none_lit            |
+    float               |
+    number              |
+    string              |
+    fstring             |
+    call                |
+    var_ref
+}
+
+list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ ","? ~ "]" }
+dict_literal = { "{" ~ (dict_pair ~ ("," ~ dict_pair)*)? ~ ","? ~ "}" }
+dict_pair    = { expr ~ ":" ~ expr }
+lambda_expr  = { "lambda" ~ param_list? ~ ":" ~ expr }
+
+call     = { identifier ~ "(" ~ arg_list? ~ ")" }
+var_ref  = { identifier }
+bool_lit = { "True" | "False" }
+none_lit = { "None" }
+
+cmp_op = { "==" | "!=" | "<=" | ">=" | "<" | ">" | "is" ~ "not" | "is" | "not" ~ "in" | "in" }
+add_op = { "+" | "-" }
+mul_op = { "//" | "*" | "/" | "%" }
+
+// ── terminals ────────────────────────────────────────────────────────────────
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+number     = @{ "0x" ~ ASCII_HEX_DIGIT+ | ASCII_DIGIT+ }
+float      = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* | "." ~ ASCII_DIGIT+ }
+string     = @{ ("\"\"\"" ~ (!"\"\"\"" ~ ANY)* ~ "\"\"\"")
+              | ("'''"    ~ (!"'''"    ~ ANY)* ~ "'''")
+              | ("\"" ~ (!"\"" ~ ANY)* ~ "\"")
+              | ("'"  ~ (!"'"  ~ ANY)* ~ "'") }
+fstring    = @{ ("f\"" ~ (!"\"" ~ ANY)* ~ "\"")
+              | ("f'"  ~ (!"'"  ~ ANY)* ~ "'") }
+
+NEWLINE   = _{ "\n" | "\r\n" | "\r" }
+INDENT    = _{ &((" " | "\t")+) }   // structural hint; actual tracking done in Rust
+DEDENT    = _{ !(" " | "\t") }
+
+WHITESPACE = _{ " " | "\t" | "\\\n" }
+COMMENT    = _{ "#" ~ (!NEWLINE ~ ANY)* }
