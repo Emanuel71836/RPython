@@ -5,10 +5,12 @@ build-backend = "maturin"
 [project]
 name = "python_rs"
 version = "0.0.1"
-description = "python_rs JIT/interpreter"
+description = "python_rs jit/interpreter"
 requires-python = ">=3.8"
 
+[project.scripts]
+"python.rs" = "python_rs:run_cli"
+
 [tool.maturin]
-# The Rust extension module must be named `python_rs` to match #[pymodule]
 module-name = "python_rs"
 features = ["pyo3/extension-module"]

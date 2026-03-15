@@ -455,46 +455,42 @@ impl VM {
                 }
 
                 OpCode::GetAttr => {
-                    let rd = insn.dst() as usize;
-                    let ro = insn.src1() as usize;
-                    let attr_idx = insn.src2() as usize;
-                    let dst = frame.reg_base + rd;
-                    let obj_reg = frame.reg_base + ro;
-                    // coerce to pyobject if needed — needs py but no cache access yet.
-                    let mut obj_val = self.register_pool[obj_reg];
-                    if !obj_val.is_pyobject() {
-                        let py = unsafe { pyo3::Python::assume_gil_acquired() };
-                        let py_obj = value_to_pyobject(py, obj_val).unwrap_or_else(|_| py.None());
-                        obj_val = Value::from_pyobject(py_obj.into_ptr());
-                        self.register_pool[obj_reg] = obj_val;
-                    }
-                    let obj_ptr = obj_val.to_pyobject().unwrap();
-                    // inline method cache: (type_ptr, attr_idx) → cached method ptr.
-                    let type_ptr = unsafe { pyo3::ffi::Py_TYPE(obj_ptr) } as usize;
-                    let cache_key = (type_ptr, attr_idx);
-                    // check cache first (immutable borrow ends before any mut borrow).
-                    let cached_ptr: Option<*mut pyo3::ffi::PyObject> =
-                        self.method_cache.get(&cache_key).copied();
-                    let result = if let Some(cached) = cached_ptr {
-                        unsafe { pyo3::ffi::Py_INCREF(cached); }
-                        cached
-                    } else {
-                        // get_py_str takes &mut self — do it after cache lookup.
-                        let attr_str = self.get_py_str(attr_idx);
-                        let r = unsafe { pyo3::ffi::PyObject_GetAttr(obj_ptr, attr_str) };
-                        if r.is_null() {
-                            let py = unsafe { pyo3::Python::assume_gil_acquired() };
-                            let attr_name = self.string_pool[attr_idx].clone();
-                            let err = PyErr::fetch(py);
-                            let err_str = err.to_string();
-                            return Err(format!("getattr: failed to get attribute '{}': {}", attr_name, err_str));
-                        }
-                        self.method_cache.insert(cache_key, r);
-                        unsafe { pyo3::ffi::Py_INCREF(r); }
-                        r
-                    };
-                    self.register_pool[dst] = Value::from_pyobject(result);
-                }
+    let rd = insn.dst() as usize;
+    let ro = insn.src1() as usize;
+    let attr_idx = insn.src2() as usize;
+    let dst = frame.reg_base + rd;
+    let obj_reg = frame.reg_base + ro;
+    let mut obj_val = self.register_pool[obj_reg];
+    if !obj_val.is_pyobject() {
+        let py = unsafe { pyo3::Python::assume_gil_acquired() };
+        let py_obj = value_to_pyobject(py, obj_val).unwrap_or_else(|_| py.None());
+        obj_val = Value::from_pyobject(py_obj.into_ptr());
+        self.register_pool[obj_reg] = obj_val;
+    }
+    let obj_ptr = obj_val.to_pyobject().unwrap();
+    // key by object identity, not type
+    let cache_key = (obj_ptr as usize, attr_idx);
+    let cached_ptr: Option<*mut pyo3::ffi::PyObject> =
+        self.method_cache.get(&cache_key).copied();
+    let result = if let Some(cached) = cached_ptr {
+        unsafe { pyo3::ffi::Py_INCREF(cached); }
+        cached
+    } else {
+        let attr_str = self.get_py_str(attr_idx);
+        let r = unsafe { pyo3::ffi::PyObject_GetAttr(obj_ptr, attr_str) };
+        if r.is_null() {
+            let py = unsafe { pyo3::Python::assume_gil_acquired() };
+            let attr_name = self.string_pool[attr_idx].clone();
+            let err = PyErr::fetch(py);
+            let err_str = err.to_string();
+            return Err(format!("getattr: failed to get attribute '{}': {}", attr_name, err_str));
+        }
+        self.method_cache.insert(cache_key, r);
+        unsafe { pyo3::ffi::Py_INCREF(r); }
+        r
+    };
+    self.register_pool[dst] = Value::from_pyobject(result);
+}
 
                 OpCode::PyCall => {
                     let rd = insn.dst() as usize;

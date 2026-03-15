@@ -22,6 +22,7 @@ pub enum Expr {
     Subscript { obj: Box<Expr>, idx: Box<Expr> },
     PyCallExpr { callable: Box<Expr>, args: Vec<Expr> },
     List(Vec<Expr>),
+    Dict(Vec<(Expr, Expr)>),  // new variant for dict literals
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,6 +95,7 @@ pub struct CodeGen {
     ir: IrProgram,
     current_block: BasicBlockId,
     last_expr_value: Option<ValueId>,
+    builtins_value: Option<ValueId>,
 }
 
 impl CodeGen {
@@ -108,6 +110,7 @@ impl CodeGen {
             ir: IrProgram::new(),
             current_block: 0,
             last_expr_value: None,
+            builtins_value: None,
         }
     }
 
@@ -187,6 +190,7 @@ impl CodeGen {
         self.symbols.clear();
         self.declared.clear();
         self.last_expr_value = None;
+        self.builtins_value = None;
         for stmt in &main_stmts {
             self.gen_stmt(stmt);
         }
@@ -200,6 +204,7 @@ impl CodeGen {
             self.symbols.clear();
             self.declared.clear();
             self.last_expr_value = None;
+            self.builtins_value = None;
             for (idx, param) in f.params.iter().enumerate() {
                 let v = self.new_value();
                 self.symbols.insert(param.clone(), v);
@@ -265,7 +270,7 @@ impl CodeGen {
             Stmt::Print(expr) => {
                 let val = self.gen_expr(expr);
                 self.add_insn(IrNode::Print(val));
-                self.last_expr_value = None; // print does not return a value
+                self.last_expr_value = None;
             }
             Stmt::While(cond, body) => {
                 let cond_block = self.new_block();
@@ -282,77 +287,75 @@ impl CodeGen {
                 }
                 self.current_block = after_block;
             }
-            Stmt::For { target, iter, body } => {
-                match iter {
-                    Expr::Call(f, args) if f == "range" && (args.len() == 1 || args.len() == 2) => {
-                        let (start_expr, stop_expr) = if args.len() == 1 {
-                            (Expr::Number(0), args[0].clone())
-                        } else {
-                            (args[0].clone(), args[1].clone())
-                        };
-                        let start_val = self.gen_expr(&start_expr);
-                        let target_reg = self.get_or_declare(target);
-                        self.add_insn(IrNode::Move(target_reg, start_val));
-                        let stop_val = self.gen_expr(&stop_expr);
+            Stmt::For { target, iter, body } => match iter {
+                Expr::Call(f, args) if f == "range" && (args.len() == 1 || args.len() == 2) => {
+                    let (start_expr, stop_expr) = if args.len() == 1 {
+                        (Expr::Number(0), args[0].clone())
+                    } else {
+                        (args[0].clone(), args[1].clone())
+                    };
+                    let start_val = self.gen_expr(&start_expr);
+                    let target_reg = self.get_or_declare(target);
+                    self.add_insn(IrNode::Move(target_reg, start_val));
+                    let stop_val = self.gen_expr(&stop_expr);
 
-                        let cond_block = self.new_block();
-                        let body_block = self.new_block();
-                        let after_block = self.new_block();
+                    let cond_block = self.new_block();
+                    let body_block = self.new_block();
+                    let after_block = self.new_block();
+                    self.add_insn(IrNode::Jump(cond_block));
+
+                    self.current_block = cond_block;
+                    let cond_dst = self.new_value();
+                    self.add_insn(IrNode::Lt(cond_dst, target_reg, stop_val));
+                    self.add_insn(IrNode::Branch(cond_dst, body_block, after_block));
+
+                    self.current_block = body_block;
+                    self.gen_stmt(body);
+                    let one = self.new_value();
+                    self.add_insn(IrNode::Const(one, Constant::Int(1)));
+                    self.add_insn(IrNode::Add(target_reg, target_reg, one));
+                    if !self.ends_with_return(self.current_block) {
                         self.add_insn(IrNode::Jump(cond_block));
-
-                        self.current_block = cond_block;
-                        let cond_dst = self.new_value();
-                        self.add_insn(IrNode::Lt(cond_dst, target_reg, stop_val));
-                        self.add_insn(IrNode::Branch(cond_dst, body_block, after_block));
-
-                        self.current_block = body_block;
-                        self.gen_stmt(body);
-                        let one = self.new_value();
-                        self.add_insn(IrNode::Const(one, Constant::Int(1)));
-                        self.add_insn(IrNode::Add(target_reg, target_reg, one));
-                        if !self.ends_with_return(self.current_block) {
-                            self.add_insn(IrNode::Jump(cond_block));
-                        }
-                        self.current_block = after_block;
                     }
-                    _ => {
-                        let iter_val = self.gen_expr(iter);
-                        let iter_obj = self.new_value();
-                        self.add_insn(IrNode::CallMethod(
-                            iter_obj,
-                            iter_val,
-                            "__iter__".into(),
-                            vec![],
-                        ));
-
-                        let cond_block = self.new_block();
-                        let body_block = self.new_block();
-                        let after_block = self.new_block();
-                        self.add_insn(IrNode::Jump(cond_block));
-
-                        self.current_block = cond_block;
-                        let item = self.new_value();
-                        self.add_insn(IrNode::CallMethod(
-                            item,
-                            iter_obj,
-                            "__next__".into(),
-                            vec![],
-                        ));
-                        let is_nil = self.new_value();
-                        self.add_insn(IrNode::Const(is_nil, Constant::Nil));
-                        self.add_insn(IrNode::Branch(item, body_block, after_block));
-
-                        self.current_block = body_block;
-                        let target_reg = self.get_or_declare(target);
-                        self.add_insn(IrNode::Move(target_reg, item));
-                        self.gen_stmt(body);
-                        if !self.ends_with_return(self.current_block) {
-                            self.add_insn(IrNode::Jump(cond_block));
-                        }
-                        self.current_block = after_block;
-                    }
+                    self.current_block = after_block;
                 }
-            }
+                _ => {
+                    let iter_val = self.gen_expr(iter);
+                    let iter_obj = self.new_value();
+                    self.add_insn(IrNode::CallMethod(
+                        iter_obj,
+                        iter_val,
+                        "__iter__".into(),
+                        vec![],
+                    ));
+
+                    let cond_block = self.new_block();
+                    let body_block = self.new_block();
+                    let after_block = self.new_block();
+                    self.add_insn(IrNode::Jump(cond_block));
+
+                    self.current_block = cond_block;
+                    let item = self.new_value();
+                    self.add_insn(IrNode::CallMethod(
+                        item,
+                        iter_obj,
+                        "__next__".into(),
+                        vec![],
+                    ));
+                    let is_nil = self.new_value();
+                    self.add_insn(IrNode::Const(is_nil, Constant::Nil));
+                    self.add_insn(IrNode::Branch(item, body_block, after_block));
+
+                    self.current_block = body_block;
+                    let target_reg = self.get_or_declare(target);
+                    self.add_insn(IrNode::Move(target_reg, item));
+                    self.gen_stmt(body);
+                    if !self.ends_with_return(self.current_block) {
+                        self.add_insn(IrNode::Jump(cond_block));
+                    }
+                    self.current_block = after_block;
+                }
+            },
             Stmt::Expr(expr) => {
                 let val = self.gen_expr(expr);
                 self.last_expr_value = Some(val);
@@ -404,7 +407,7 @@ impl CodeGen {
             }
             Expr::Float(f) => {
                 let v = self.new_value();
-                self.add_insn(IrNode::Const(v, Constant::Float(*f))); // <-- fixed
+                self.add_insn(IrNode::Const(v, Constant::Float(*f)));
                 v
             }
             Expr::Bool(b) => {
@@ -516,16 +519,26 @@ impl CodeGen {
             }
             Expr::Call(name, args) => {
                 if let Some(&func_id) = self.func_index.get(name) {
+                    // user-defined function
                     let arg_vals: Vec<_> = args.iter().map(|a| self.gen_expr(a)).collect();
                     let dst = self.new_value();
                     self.add_insn(IrNode::Call(dst, func_id, arg_vals));
                     dst
                 } else {
-                    let callable = self.new_value();
-                    self.add_insn(IrNode::ImportPython(callable, name.clone()));
+                    // built-in function: get it from the builtins module
+                    let builtins = if let Some(b) = self.builtins_value {
+                        b
+                    } else {
+                        let b = self.new_value();
+                        self.add_insn(IrNode::ImportPython(b, "builtins".into()));
+                        self.builtins_value = Some(b);
+                        b
+                    };
+                    let func = self.new_value();
+                    self.add_insn(IrNode::GetAttr(func, builtins, name.clone()));
                     let arg_vals: Vec<_> = args.iter().map(|a| self.gen_expr(a)).collect();
                     let dst = self.new_value();
-                    self.add_insn(IrNode::PyCall(dst, callable, arg_vals));
+                    self.add_insn(IrNode::PyCall(dst, func, arg_vals));
                     dst
                 }
             }
@@ -548,6 +561,34 @@ impl CodeGen {
                 }
 
                 empty_list
+            }
+                        Expr::Dict(items) => {
+                // create an empty dict via builtins.dict()
+                let builtins = if let Some(b) = self.builtins_value {
+                    b
+                } else {
+                    let b = self.new_value();
+                    self.add_insn(IrNode::ImportPython(b, "builtins".into()));
+                    self.builtins_value = Some(b);
+                    b
+                };
+                let dict_fn = self.new_value();
+                self.add_insn(IrNode::GetAttr(dict_fn, builtins, "dict".into()));
+                let empty_dict = self.new_value();
+                self.add_insn(IrNode::PyCall(empty_dict, dict_fn, vec![]));
+
+                // get the __setitem__ method
+                let setitem = self.new_value();
+                self.add_insn(IrNode::GetAttr(setitem, empty_dict, "__setitem__".into()));
+
+                for (key_expr, value_expr) in items {
+                    let key_val = self.gen_expr(key_expr);
+                    let value_val = self.gen_expr(value_expr);
+                    let temp = self.new_value();
+                    self.add_insn(IrNode::PyCall(temp, setitem, vec![key_val, value_val]));
+                }
+
+                empty_dict
             }
             Expr::GetAttr { obj, attr } => {
                 let obj_val = self.gen_expr(obj);

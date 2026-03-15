@@ -1,0 +1,13 @@
+import pandas as pd
+
+sales_data = {
+    'Product': ['Notebook', 'Mouse', 'Monitor', 'Keyboard'],
+    'Quantity': [2, 10, 5, 8],
+    'Unit_Price': [3500.00, 50.00, 800.00, 150.00]
+}
+
+print("sales_data dict:", sales_data)
+print("lengths:", len(sales_data['Product']), len(sales_data['Quantity']), len(sales_data['Unit_Price']))
+
+df = pd.DataFrame(sales_data)
+print(df)

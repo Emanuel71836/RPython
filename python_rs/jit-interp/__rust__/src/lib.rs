@@ -38,6 +38,7 @@ use frontend::{
 };
 use lower::LoweringContext;
 use vm::VM;
+use value::Value;
 
 // rustpython ast types
 use parser::{PyStmt, PyExpr, Operator, UnaryOp, BoolOp, CmpOp, Constant};
@@ -208,6 +209,20 @@ fn convert_expr(expr: &PyExpr) -> FrontendExpr {
 
         // list literal
         PyExpr::List(l) => FrontendExpr::List(l.elts.iter().map(convert_expr).collect()),
+
+                PyExpr::Dict(d) => {
+            let mut items = Vec::new();
+            // zip keys and values; keys are Option<Expr> (None for ** unpacking)
+            for (k_opt, v) in d.keys.iter().zip(d.values.iter()) {
+                if let Some(k) = k_opt {
+                    items.push((convert_expr(k), convert_expr(v)));
+                } else {
+                    // skip ** unpacking for now
+                    continue;
+                }
+            }
+            FrontendExpr::Dict(items)
+        }
 
         // tuple (treat as list)
         PyExpr::Tuple(t) => FrontendExpr::List(t.elts.iter().map(convert_expr).collect()),
@@ -510,9 +525,9 @@ fn load_ry_file(
     Ok(())
 }
 
-// pipeline
+// pipeline that returns a Value
 
-fn run_pipeline(funcs: Vec<FrontendFunc>, main_stmts: Vec<FrontendStmt>) -> Result<String, String> {
+fn run_pipeline_value(funcs: Vec<FrontendFunc>, main_stmts: Vec<FrontendStmt>) -> Result<Value, String> {
     let mut codegen   = CodeGen::new();
     let ir_program    = codegen.generate(funcs, main_stmts);
     let mut lower_ctx = LoweringContext::new();
@@ -525,20 +540,28 @@ fn run_pipeline(funcs: Vec<FrontendFunc>, main_stmts: Vec<FrontendStmt>) -> Resu
         unsafe { JIT_THRESHOLD },
         1024,
     );
-    vm.run().map(|val| format!("{:?}", val))
+    vm.run()
 }
 
-fn compile_source(code: &str) -> Result<String, String> {
+fn run_pipeline_string(funcs: Vec<FrontendFunc>, main_stmts: Vec<FrontendStmt>) -> Result<String, String> {
+    run_pipeline_value(funcs, main_stmts).map(|val| format!("{:?}", val))
+}
+
+fn compile_source_value(code: &str) -> Result<Value, String> {
     let stmts = parser::parse_python(code)?;
     let dir   = Path::new(".");
     let mut declared     = HashSet::new();
     let mut extra_funcs  = Vec::new();
     let mut already      = HashSet::new();
     let main_stmts = split_stmts(stmts, &mut declared, dir, &mut already, &mut extra_funcs);
-    run_pipeline(extra_funcs, main_stmts)
+    run_pipeline_value(extra_funcs, main_stmts)
 }
 
-pub fn compile_file(filename: &str) -> Result<String, String> {
+fn compile_source(code: &str) -> Result<String, String> {
+    compile_source_value(code).map(|val| format!("{:?}", val))
+}
+
+pub fn compile_file_value(filename: &str) -> Result<Value, String> {
     let code  = fs::read_to_string(filename)
         .map_err(|e| format!("cannot read {filename}: {e}"))?;
     let stmts = parser::parse_python(&code)
@@ -549,7 +572,11 @@ pub fn compile_file(filename: &str) -> Result<String, String> {
     let mut extra_funcs = Vec::new();
     let mut already     = HashSet::new();
     let main_stmts = split_stmts(stmts, &mut declared, dir, &mut already, &mut extra_funcs);
-    run_pipeline(extra_funcs, main_stmts)
+    run_pipeline_value(extra_funcs, main_stmts)
+}
+
+pub fn compile_file(filename: &str) -> Result<String, String> {
+    compile_file_value(filename).map(|val| format!("{:?}", val))
 }
 
 // pyo3 entry‑points
@@ -603,6 +630,36 @@ fn set_thread_count(n: usize) {
     rayon::ThreadPoolBuilder::new().num_threads(n).build_global().unwrap();
 }
 
+// cli entry point
+use pyo3::types::PyModule;
+use std::process;
+
+#[pyfunction]
+fn run_cli(py: Python) -> PyResult<()> {
+    // get sys.argv from python (works even when embedded)
+    let sys = py.import("sys")?;
+    let argv: Vec<String> = sys.getattr("argv")?.extract()?;
+
+    if argv.len() != 2 {
+        eprintln!("usage: python.rs <file.ry>");
+        process::exit(1);
+    }
+
+    let filename = &argv[1];
+    match py.allow_threads(|| compile_file_value(filename)) {
+        Ok(val) => {
+            if !val.is_nil() {
+                println!("{:?}", val);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
 #[pymodule]
 fn python_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python_rs_run,       m)?)?;
@@ -611,5 +668,6 @@ fn python_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile_many,      m)?)?;
     m.add_function(wrap_pyfunction!(set_jit_threshold, m)?)?;
     m.add_function(wrap_pyfunction!(set_thread_count,  m)?)?;
+    m.add_function(wrap_pyfunction!(run_cli,            m)?)?;
     Ok(())
 }
