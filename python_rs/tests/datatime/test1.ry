@@ -1,0 +1,9 @@
+import datetime
+
+# Teste de lógica pura: data e hora
+agora = datetime.datetime.now()
+print(f"Data atual: {agora.year}-{agora.month}-{agora.day}")
+
+# Criando um intervalo
+vencimento = agora + datetime.timedelta(days=7)
+print(f"Data de vencimento: {vencimento}")
