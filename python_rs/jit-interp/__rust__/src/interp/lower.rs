@@ -11,18 +11,26 @@ pub struct LoweringContext {
     pending_jumps: Vec<(usize, BasicBlockId, bool)>,
     string_pool:   Vec<String>,
     string_map:    HashMap<String, u16>,
-    float_pool:    Vec<f64>,          // new
-    float_map:     HashMap<u64, u16>, // new: map f64 bits to index
+    float_pool:    Vec<f64>,
+    float_map:     HashMap<u64, u16>,
+    int_pool:      Vec<i64>,
+    int_map:       HashMap<i64, u16>,
 }
 
 impl LoweringContext {
     pub fn new() -> Self {
         LoweringContext {
-            reg_map: Vec::new(), next_reg: 0,
+            reg_map: Vec::new(),
+            next_reg: 0,
             bytecode: Vec::new(),
-            block_starts: HashMap::new(), pending_jumps: Vec::new(),
-            string_pool: Vec::new(), string_map: HashMap::new(),
-            float_pool: Vec::new(), float_map: HashMap::new(),
+            block_starts: HashMap::new(),
+            pending_jumps: Vec::new(),
+            string_pool: Vec::new(),
+            string_map: HashMap::new(),
+            float_pool: Vec::new(),
+            float_map: HashMap::new(),
+            int_pool: Vec::new(),
+            int_map: HashMap::new(),
         }
     }
 
@@ -51,12 +59,24 @@ impl LoweringContext {
         i
     }
 
-    fn lower_function(&mut self, func: &Function) -> (Vec<Instruction>, usize) {
-        self.reg_map.clear();   self.next_reg = 0;
-        self.bytecode.clear();
-        self.block_starts.clear(); self.pending_jumps.clear();
+    fn intern_int(&mut self, i: i64) -> u16 {
+        if let Some(&idx) = self.int_map.get(&i) { return idx; }
+        let idx = self.int_pool.len() as u16;
+        self.int_pool.push(i);
+        self.int_map.insert(i, idx);
+        idx
+    }
 
-        for (idx, _) in func.params.iter().enumerate() { self.ensure_reg(idx as ValueId); }
+    fn lower_function(&mut self, func: &Function) -> (Vec<Instruction>, usize) {
+        self.reg_map.clear();
+        self.next_reg = 0;
+        self.bytecode.clear();
+        self.block_starts.clear();
+        self.pending_jumps.clear();
+
+        for (idx, _) in func.params.iter().enumerate() {
+            self.ensure_reg(idx as ValueId);
+        }
 
         for block in &func.blocks {
             self.block_starts.insert(block.id, self.bytecode.len());
@@ -71,7 +91,12 @@ impl LoweringContext {
 
                     IrNode::Const(dst, Constant::Int(i)) => {
                         let rd = self.ensure_reg(*dst);
-                        self.bytecode.push(Instruction::encode_imm(OpCode::LoadConst, rd, *i as u16));
+                        if *i >= -32768 && *i <= 32767 {
+                            self.bytecode.push(Instruction::encode_imm(OpCode::LoadConst, rd, *i as u16));
+                        } else {
+                            let idx = self.intern_int(*i);
+                            self.bytecode.push(Instruction::encode_imm(OpCode::LoadInt, rd, idx));
+                        }
                     }
                     IrNode::Const(dst, Constant::Float(f)) => {
                         let rd = self.ensure_reg(*dst);
@@ -87,7 +112,7 @@ impl LoweringContext {
                         self.bytecode.push(Instruction::encode_imm(OpCode::LoadNil, rd, 0));
                     }
                     IrNode::Const(dst, Constant::String(s)) => {
-                        let rd  = self.ensure_reg(*dst);
+                        let rd = self.ensure_reg(*dst);
                         let idx = self.intern(s);
                         self.bytecode.push(Instruction::encode_imm(OpCode::LoadString, rd, idx));
                     }
@@ -215,7 +240,7 @@ impl LoweringContext {
     }
 
     pub fn lower_program(&mut self, program: &IrProgram)
-        -> (Vec<(Rc<Vec<Instruction>>, usize, usize)>, Vec<String>, Vec<f64>) // also return float_pool
+        -> (Vec<(Rc<Vec<Instruction>>, usize, usize)>, Vec<String>, Vec<f64>, Vec<i64>)
     {
         let mut functions = Vec::new();
         for func in &program.functions {
@@ -223,6 +248,6 @@ impl LoweringContext {
             let param_count = func.params.len();
             functions.push((Rc::new(bytecode), param_count, max_reg));
         }
-        (functions, self.string_pool.clone(), self.float_pool.clone())
+        (functions, self.string_pool.clone(), self.float_pool.clone(), self.int_pool.clone())
     }
 }

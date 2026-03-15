@@ -22,7 +22,7 @@ pub enum Expr {
     Subscript { obj: Box<Expr>, idx: Box<Expr> },
     PyCallExpr { callable: Box<Expr>, args: Vec<Expr> },
     List(Vec<Expr>),
-    Dict(Vec<(Expr, Expr)>),  // new variant for dict literals
+    Dict(Vec<(Expr, Expr)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -543,8 +543,14 @@ impl CodeGen {
                 }
             }
             Expr::List(items) => {
-                let builtins = self.new_value();
-                self.add_insn(IrNode::ImportPython(builtins, "builtins".into()));
+                let builtins = if let Some(b) = self.builtins_value {
+                    b
+                } else {
+                    let b = self.new_value();
+                    self.add_insn(IrNode::ImportPython(b, "builtins".into()));
+                    self.builtins_value = Some(b);
+                    b
+                };
                 let list_fn = self.new_value();
                 self.add_insn(IrNode::GetAttr(list_fn, builtins, "list".into()));
 
@@ -562,8 +568,7 @@ impl CodeGen {
 
                 empty_list
             }
-                        Expr::Dict(items) => {
-                // create an empty dict via builtins.dict()
+            Expr::Dict(items) => {
                 let builtins = if let Some(b) = self.builtins_value {
                     b
                 } else {
@@ -574,10 +579,10 @@ impl CodeGen {
                 };
                 let dict_fn = self.new_value();
                 self.add_insn(IrNode::GetAttr(dict_fn, builtins, "dict".into()));
+
                 let empty_dict = self.new_value();
                 self.add_insn(IrNode::PyCall(empty_dict, dict_fn, vec![]));
 
-                // get the __setitem__ method
                 let setitem = self.new_value();
                 self.add_insn(IrNode::GetAttr(setitem, empty_dict, "__setitem__".into()));
 

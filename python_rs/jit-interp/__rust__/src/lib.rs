@@ -210,7 +210,8 @@ fn convert_expr(expr: &PyExpr) -> FrontendExpr {
         // list literal
         PyExpr::List(l) => FrontendExpr::List(l.elts.iter().map(convert_expr).collect()),
 
-                PyExpr::Dict(d) => {
+        // dict literal
+        PyExpr::Dict(d) => {
             let mut items = Vec::new();
             // zip keys and values; keys are Option<Expr> (None for ** unpacking)
             for (k_opt, v) in d.keys.iter().zip(d.values.iter()) {
@@ -531,11 +532,12 @@ fn run_pipeline_value(funcs: Vec<FrontendFunc>, main_stmts: Vec<FrontendStmt>) -
     let mut codegen   = CodeGen::new();
     let ir_program    = codegen.generate(funcs, main_stmts);
     let mut lower_ctx = LoweringContext::new();
-    let (functions, string_pool, float_pool) = lower_ctx.lower_program(&ir_program);
+    let (functions, string_pool, float_pool, int_pool) = lower_ctx.lower_program(&ir_program);
     let mut vm = VM::new(
         functions,
         string_pool,
         float_pool,
+        int_pool,
         1024 * 1024,
         unsafe { JIT_THRESHOLD },
         1024,

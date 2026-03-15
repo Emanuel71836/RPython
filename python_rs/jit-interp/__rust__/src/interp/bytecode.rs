@@ -11,7 +11,8 @@ pub enum OpCode {
     LoadBool,
     LoadNil,
     LoadString,
-    LoadFloat,   // new
+    LoadFloat,
+    LoadInt,
     Jump,
     Branch,
     Return,

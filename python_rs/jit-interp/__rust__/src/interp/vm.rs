@@ -91,13 +91,14 @@ pub struct VM {
     pub functions: Vec<Function>,
     pub string_pool: Vec<String>,
     pub float_pool: Vec<f64>,
+    pub int_pool: Vec<i64>,
     /// interned python string objects for each string_pool entry.
     /// built lazily on first python interop use; avoids rust→pyunicode on every attr access.
     py_string_cache: Vec<Option<*mut pyo3::ffi::PyObject>>,
 
     /// inline method cache: maps (obj_ptr, attr_pool_idx) → cached bound method pyobject*.
     /// keyed by object identity so each instance gets its own bound method cached correctly.
-    method_cache: std::collections::HashMap<(usize, usize), *mut pyo3::ffi::PyObject>,
+    pub method_cache: std::collections::HashMap<(usize, usize), *mut pyo3::ffi::PyObject>,
     arena: Arena,
     pub profiler: Profiler,
     max_call_depth: usize,
@@ -111,6 +112,7 @@ impl VM {
         functions: Vec<(Rc<Vec<Instruction>>, usize, usize)>,
         string_pool: Vec<String>,
         float_pool: Vec<f64>,
+        int_pool: Vec<i64>,
         arena_capacity: usize,
         hot_threshold: usize,
         max_call_depth: usize,
@@ -143,6 +145,7 @@ impl VM {
             functions: funcs,
             string_pool,
             float_pool,
+            int_pool,
             py_string_cache: vec![None; pool_len],
 
             method_cache: std::collections::HashMap::new(),
@@ -167,10 +170,10 @@ impl VM {
 
     // helper: returns true if the bytecode contains any python‑interop opcode.
     fn has_python_interop(bytecode: &[Instruction]) -> bool {
-    bytecode.iter().any(|insn| matches!(insn.opcode(),
-        OpCode::ImportPython | OpCode::GetAttr | OpCode::PyCall | 
-        OpCode::ConvertFromPy | OpCode::CallMethod | OpCode::Print))
-}
+        bytecode.iter().any(|insn| matches!(insn.opcode(),
+            OpCode::ImportPython | OpCode::GetAttr | OpCode::PyCall | 
+            OpCode::ConvertFromPy | OpCode::CallMethod | OpCode::Print))
+    }
 
     pub fn run(&mut self) -> Result<Value, String> {
         let needs_gil = self.functions.iter()
@@ -286,6 +289,15 @@ impl VM {
                     let dst = frame.reg_base + insn.dst() as usize;
                     let imm = insn.imm() as i64;
                     self.register_pool[dst] = Value::from_int(imm);
+                }
+                OpCode::LoadInt => {
+                    let dst = frame.reg_base + insn.dst() as usize;
+                    let idx = insn.imm() as usize;
+                    if idx >= self.int_pool.len() {
+                        panic!("loadint: index {} out of bounds", idx);
+                    }
+                    let val = self.int_pool[idx];
+                    self.register_pool[dst] = Value::from_int(val);
                 }
                 OpCode::LoadBool => {
                     let dst = frame.reg_base + insn.dst() as usize;
@@ -455,42 +467,42 @@ impl VM {
                 }
 
                 OpCode::GetAttr => {
-    let rd = insn.dst() as usize;
-    let ro = insn.src1() as usize;
-    let attr_idx = insn.src2() as usize;
-    let dst = frame.reg_base + rd;
-    let obj_reg = frame.reg_base + ro;
-    let mut obj_val = self.register_pool[obj_reg];
-    if !obj_val.is_pyobject() {
-        let py = unsafe { pyo3::Python::assume_gil_acquired() };
-        let py_obj = value_to_pyobject(py, obj_val).unwrap_or_else(|_| py.None());
-        obj_val = Value::from_pyobject(py_obj.into_ptr());
-        self.register_pool[obj_reg] = obj_val;
-    }
-    let obj_ptr = obj_val.to_pyobject().unwrap();
-    // key by object identity, not type
-    let cache_key = (obj_ptr as usize, attr_idx);
-    let cached_ptr: Option<*mut pyo3::ffi::PyObject> =
-        self.method_cache.get(&cache_key).copied();
-    let result = if let Some(cached) = cached_ptr {
-        unsafe { pyo3::ffi::Py_INCREF(cached); }
-        cached
-    } else {
-        let attr_str = self.get_py_str(attr_idx);
-        let r = unsafe { pyo3::ffi::PyObject_GetAttr(obj_ptr, attr_str) };
-        if r.is_null() {
-            let py = unsafe { pyo3::Python::assume_gil_acquired() };
-            let attr_name = self.string_pool[attr_idx].clone();
-            let err = PyErr::fetch(py);
-            let err_str = err.to_string();
-            return Err(format!("getattr: failed to get attribute '{}': {}", attr_name, err_str));
-        }
-        self.method_cache.insert(cache_key, r);
-        unsafe { pyo3::ffi::Py_INCREF(r); }
-        r
-    };
-    self.register_pool[dst] = Value::from_pyobject(result);
-}
+                    let rd = insn.dst() as usize;
+                    let ro = insn.src1() as usize;
+                    let attr_idx = insn.src2() as usize;
+                    let dst = frame.reg_base + rd;
+                    let obj_reg = frame.reg_base + ro;
+                    let mut obj_val = self.register_pool[obj_reg];
+                    if !obj_val.is_pyobject() {
+                        let py = unsafe { pyo3::Python::assume_gil_acquired() };
+                        let py_obj = value_to_pyobject(py, obj_val).unwrap_or_else(|_| py.None());
+                        obj_val = Value::from_pyobject(py_obj.into_ptr());
+                        self.register_pool[obj_reg] = obj_val;
+                    }
+                    let obj_ptr = obj_val.to_pyobject().unwrap();
+                    // key by object identity, not type
+                    let cache_key = (obj_ptr as usize, attr_idx);
+                    let cached_ptr: Option<*mut pyo3::ffi::PyObject> =
+                        self.method_cache.get(&cache_key).copied();
+                    let result = if let Some(cached) = cached_ptr {
+                        unsafe { pyo3::ffi::Py_INCREF(cached); }
+                        cached
+                    } else {
+                        let attr_str = self.get_py_str(attr_idx);
+                        let r = unsafe { pyo3::ffi::PyObject_GetAttr(obj_ptr, attr_str) };
+                        if r.is_null() {
+                            let py = unsafe { pyo3::Python::assume_gil_acquired() };
+                            let attr_name = self.string_pool[attr_idx].clone();
+                            let err = PyErr::fetch(py);
+                            let err_str = err.to_string();
+                            return Err(format!("getattr: failed to get attribute '{}': {}", attr_name, err_str));
+                        }
+                        self.method_cache.insert(cache_key, r);
+                        unsafe { pyo3::ffi::Py_INCREF(r); }
+                        r
+                    };
+                    self.register_pool[dst] = Value::from_pyobject(result);
+                }
 
                 OpCode::PyCall => {
                     let rd = insn.dst() as usize;
@@ -691,10 +703,6 @@ impl VM {
                     }
                     let obj_raw_ptr = obj_val.to_pyobject().unwrap();
                     // key by object identity (obj_ptr), not type_ptr.
-                    // type_ptr was wrong: all tensors share the same type_ptr, so
-                    // arange(4).float() would cache the bound method, and then
-                    // arange(6).float() would reuse the same bound method — which
-                    // is still bound to the 4‑element tensor — producing size=4 errors.
                     let cache_key = (obj_raw_ptr as usize, attr_idx);
 
                     // immutable cache lookup ends before any mut borrow.
@@ -844,17 +852,26 @@ pub unsafe extern "C" fn ry_jit_import(vm: *mut VM, name_idx: u64) -> u64 {
 pub unsafe extern "C" fn ry_jit_getattr(vm: *mut VM, obj: u64, attr_idx: u64) -> u64 {
     let vm = &mut *vm;
     let obj_val = Value(obj);
-    let attr_name = &vm.string_pool[attr_idx as usize];
+    let attr_idx = attr_idx as usize;
+    let attr_name = &vm.string_pool[attr_idx];
     if !obj_val.is_pyobject() {
         panic!("ry_jit_getattr: object is not a pyobject");
     }
+    let obj_ptr = obj_val.to_pyobject().unwrap();
+    let cache_key = (obj_ptr as usize, attr_idx);
+    // check the method cache first
+    if let Some(&cached) = vm.method_cache.get(&cache_key) {
+        unsafe { pyo3::ffi::Py_INCREF(cached); }
+        return Value::from_pyobject(cached).0;
+    }
     pyo3::Python::with_gil(|py| {
-        let py_obj = unsafe { PyObject::from_borrowed_ptr(py, obj_val.to_pyobject().unwrap()) };
+        let py_obj = unsafe { PyObject::from_borrowed_ptr(py, obj_ptr) };
         let attr = py_obj.getattr(py, attr_name).unwrap_or_else(|e| {
             e.print(py);
             panic!("ry_jit_getattr: failed to get attribute '{}'", attr_name);
         });
         let raw = attr.into_ptr();
+        vm.method_cache.insert(cache_key, raw);
         Value::from_pyobject(raw).0
     })
 }
@@ -946,9 +963,21 @@ pub unsafe extern "C" fn ry_load_float(vm: *mut VM, idx: u64) -> u64 {
     Value::from_f64(f).0
 }
 
+/// helper for jit: load an int constant from the int pool.
+#[no_mangle]
+pub unsafe extern "C" fn ry_load_int(vm: *mut VM, idx: u64) -> u64 {
+    let vm = &mut *vm;
+    let idx = idx as usize;
+    if idx >= vm.int_pool.len() {
+        panic!("ry_load_int: index {} out of bounds", idx);
+    }
+    let i = vm.int_pool[idx];
+    Value::from_int(i).0
+}
+
 /// helper for jit: print a value.
 #[no_mangle]
-pub unsafe extern "C" fn ry_print_value(vm: *mut VM, val: u64) -> u64 {
+pub unsafe extern "C" fn ry_print_value(_vm: *mut VM, val: u64) -> u64 {
     let val = Value(val);
     if val.is_pyobject() {
         pyo3::Python::with_gil(|py| {
@@ -963,7 +992,7 @@ pub unsafe extern "C" fn ry_print_value(vm: *mut VM, val: u64) -> u64 {
     } else {
         println!("{:?}", val);
     }
-    0 // return value unused
+    0
 }
 
 // slow‑path interpreter with python opcode support
@@ -1056,6 +1085,13 @@ pub unsafe extern "C" fn ry_jit_call(
                             Value::from_bool(a <= b) } else { Value::from_bool(false) };
                     }
                     OpCode::LoadConst  => { registers[insn.dst() as usize] = Value::from_int(insn.imm() as i64); }
+                    OpCode::LoadInt => {
+                        let idx = insn.imm() as usize;
+                        if idx >= vm.int_pool.len() {
+                            panic!("loadint: index {} out of bounds", idx);
+                        }
+                        registers[insn.dst() as usize] = Value::from_int(vm.int_pool[idx]);
+                    }
                     OpCode::LoadBool   => { registers[insn.dst() as usize] = Value::from_bool(insn.imm() != 0); }
                     OpCode::LoadNil    => { registers[insn.dst() as usize] = Value::nil(); }
                     OpCode::LoadString => {
@@ -1249,6 +1285,13 @@ pub unsafe extern "C" fn ry_jit_call(
                         Value::from_bool(a <= b) } else { Value::from_bool(false) };
                 }
                 OpCode::LoadConst  => { registers[insn.dst() as usize] = Value::from_int(insn.imm() as i64); }
+                OpCode::LoadInt => {
+                    let idx = insn.imm() as usize;
+                    if idx >= vm.int_pool.len() {
+                        panic!("loadint: index {} out of bounds", idx);
+                    }
+                    registers[insn.dst() as usize] = Value::from_int(vm.int_pool[idx]);
+                }
                 OpCode::LoadBool   => { registers[insn.dst() as usize] = Value::from_bool(insn.imm() != 0); }
                 OpCode::LoadNil    => { registers[insn.dst() as usize] = Value::nil(); }
                 OpCode::LoadString => {
